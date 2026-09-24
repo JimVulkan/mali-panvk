@@ -1063,7 +1063,7 @@ with_llvm = with_llvm \
 
 with_poly = [
   with_gallium_asahi, with_asahi_vk, with_tools.contains('asahi'),
-  with_kosmickrisp_vk, with_panfrost_vk,
+  with_kosmickrisp_vk, with_panfrost_vk, with_gallium_panfrost,
 ].contains(true)
 
 dep_clc = null_dep
@@ -2160,7 +2160,8 @@ if not with_platform_windows and not dep_elf.found()
 endif
 if dep_elf.found()
   pre_args += '-DUSE_LIBELF'
-elif with_gallium_radeonsi and with_gfx_compute
+elif with_gallium_radeonsi and with_gfx_compute and amd_with_llvm
+  # Only LLVM emits ELF shader binaries; ACO binaries are raw (see ac_rtld_stub.c).
   error('Gallium driver radeonsi requires libelf')
 elif with_nouveau_vk
   error('NVK requires libelf')

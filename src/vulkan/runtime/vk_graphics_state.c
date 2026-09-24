@@ -517,6 +517,24 @@ vk_viewport_state_init(struct vk_viewport_state *vp,
          vp->depth_clip_negative_one_to_one = vp_dcc_info->negativeOneToOne;
    }
 
+   /* VK_NV_viewport_swizzle. There is no dynamic state for this in RADV -- the
+    * swizzle is compiled into the last pre-rasterization stage.
+    */
+   const VkPipelineViewportSwizzleStateCreateInfoNV *vp_sw_info =
+      vk_find_struct_const(vp_info->pNext,
+                           PIPELINE_VIEWPORT_SWIZZLE_STATE_CREATE_INFO_NV);
+   if (vp_sw_info != NULL && vp_sw_info->viewportCount > 0) {
+      assert(vp_sw_info->viewportCount <= MESA_VK_MAX_VIEWPORTS);
+      vp->swizzle_count = MIN2(vp_sw_info->viewportCount, MESA_VK_MAX_VIEWPORTS);
+
+      for (uint32_t i = 0; i < vp->swizzle_count; i++) {
+         vp->swizzles[i][0] = vp_sw_info->pViewportSwizzles[i].x;
+         vp->swizzles[i][1] = vp_sw_info->pViewportSwizzles[i].y;
+         vp->swizzles[i][2] = vp_sw_info->pViewportSwizzles[i].z;
+         vp->swizzles[i][3] = vp_sw_info->pViewportSwizzles[i].w;
+      }
+   }
+
    if (!IS_DYNAMIC(VP_DEPTH_CLAMP_RANGE)) {
       const VkPipelineViewportDepthClampControlCreateInfoEXT *vp_dcc_info =
          vk_find_struct_const(vp_info->pNext,

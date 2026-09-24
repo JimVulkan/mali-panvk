@@ -170,6 +170,13 @@ disk_cache_create_custom(const char *gpu_name, const char *driver_id,
                          uint64_t driver_flags, const char *cache_dir_name,
                          uint32_t max_size);
 
+/* Android: Mesa keeps the disk cache off and apps have no HOME. A driver can set an app-private
+ * directory here before disk_cache_create(); the cache is then enabled there by default.
+ * MESA_SHADER_CACHE_DISABLE / MESA_SHADER_CACHE_DIR (env or mesa.* property) still win.
+ * NULL clears it. */
+void
+disk_cache_set_default_dir(const char *dir);
+
 /**
  * Destroy a cache object, (freeing all associated resources).
  */
@@ -285,6 +292,11 @@ disk_cache_create_custom(const char *gpu_name, const char *driver_id,
                          uint32_t max_size)
 {
    return NULL;
+}
+
+static inline void
+disk_cache_set_default_dir(const char *dir)
+{
 }
 
 static inline void

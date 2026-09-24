@@ -44,6 +44,7 @@ vulkan_lite_runtime_files = files(
   'vk_sync_timeline.c',
   'vk_synchronization.c',
   'vk_video.c',
+  'vk_xclipse_perf.c',
   'vk_ycbcr_conversion.c',
 )
 

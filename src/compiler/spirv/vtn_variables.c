@@ -1547,6 +1547,13 @@ apply_var_decoration(struct vtn_builder *b,
       var_data->per_vertex = true;
       break;
 
+   case SpvDecorationPassthroughNV:
+      /* SPV_NV_geometry_shader_passthrough. */
+      vtn_fail_if(b->shader->info.stage != MESA_SHADER_GEOMETRY,
+                  "PassthroughNV decoration only allowed in Geometry shaders");
+      var_data->passthrough = true;
+      break;
+
    case SpvDecorationNodeMaxPayloadsAMDX:
       vtn_fail_if(b->shader->info.stage != MESA_SHADER_COMPUTE,
                   "NodeMaxPayloadsAMDX decoration only allowed in compute shaders");

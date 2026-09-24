@@ -764,6 +764,13 @@ typedef struct nir_variable {
       unsigned per_vertex : 1;
 
       /**
+       * VK_NV_geometry_shader_passthrough / SpvDecorationPassthroughNV: a geometry shader input
+       * copied straight to its output for every vertex. Lowered by
+       * radv_nir_lower_passthrough_gs.c.
+       */
+      unsigned passthrough : 1;
+
+      /**
        * Whether the shared memory block that this variable represent alias
        * with other similarly decorated shared memory blocks.  These are Blocks
        * marked as Aliased in SPIR-V.

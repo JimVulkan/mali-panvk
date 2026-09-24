@@ -176,7 +176,7 @@ os_log_message(const char *message)
  *
  */
 static char *
-os_get_android_option(const char *name)
+os_get_android_option_uncached(const char *name)
 {
    static thread_local char os_android_option_value[PROP_VALUE_MAX];
    char key[PROP_NAME_MAX];
@@ -205,6 +205,47 @@ os_get_android_option(const char *name)
          return os_android_option_value;
    }
    return NULL;
+}
+
+/* Cache every answer, "not set" included: some options are read per shader, and each miss probes
+ * debug./vendor./mesa. properties (vendor.* denials spam the log). */
+#define OS_ANDROID_OPTION_CACHE_SIZE 64
+static struct {
+   char *name;
+   char *value;
+} os_android_option_cache[OS_ANDROID_OPTION_CACHE_SIZE];
+static unsigned os_android_option_cache_count;
+static simple_mtx_t os_android_option_cache_mtx = SIMPLE_MTX_INITIALIZER;
+
+static const char *
+os_get_android_option(const char *name)
+{
+   const char *ret;
+   simple_mtx_lock(&os_android_option_cache_mtx);
+   for (unsigned i = 0; i < os_android_option_cache_count; i++) {
+      if (!strcmp(os_android_option_cache[i].name, name)) {
+         ret = os_android_option_cache[i].value;
+         simple_mtx_unlock(&os_android_option_cache_mtx);
+         return ret;
+      }
+   }
+   const char *value = os_get_android_option_uncached(name);
+   ret = value;
+   if (os_android_option_cache_count < OS_ANDROID_OPTION_CACHE_SIZE) {
+      char *name_dup = strdup(name);
+      char *value_dup = value ? strdup(value) : NULL;
+      if (name_dup && (!value || value_dup)) {
+         os_android_option_cache[os_android_option_cache_count].name = name_dup;
+         os_android_option_cache[os_android_option_cache_count].value = value_dup;
+         os_android_option_cache_count++;
+         ret = value_dup;
+      } else {
+         free(name_dup);
+         free(value_dup);
+      }
+   }
+   simple_mtx_unlock(&os_android_option_cache_mtx);
+   return ret;
 }
 #endif
 

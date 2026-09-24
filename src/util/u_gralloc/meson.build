@@ -34,6 +34,11 @@ if with_freedreno_vk or with_gallium_freedreno
   c_args_for_u_gralloc += '-DHAS_FREEDRENO'
 endif
 
+# XCLIPSE: read Samsung gralloc handles directly (RADV WSI, radeonsi EGL window surfaces).
+if with_amd_vk or with_gallium_radeonsi
+  c_args_for_u_gralloc += '-DHAS_SAMSUNG_GRALLOC'
+endif
+
 _libmesa_u_gralloc = static_library(
   '_mesa_u_gralloc',
   [files_u_gralloc],

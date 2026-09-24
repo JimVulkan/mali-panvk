@@ -92,6 +92,10 @@ split_variable(struct nir_variable *var, nir_shader *shader,
             glsl_get_struct_field(var->interface_type, i);
       }
       members[i]->data = var->members[i];
+
+      /* Member data comes from var->members[i], so block-level decorations are lost here. A block
+       * marked passthrough (gl_PerVertex with PassthroughNV) means every member is passthrough. */
+      members[i]->data.passthrough |= var->data.passthrough;
    }
 
    _mesa_hash_table_insert(var_to_member_map, var, members);

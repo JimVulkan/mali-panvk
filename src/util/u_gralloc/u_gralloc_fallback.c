@@ -44,6 +44,87 @@ get_native_buffer_fds(const native_handle_t *handle, int fds[3])
    return handle->numFds;
 }
 
+#ifdef HAS_SAMSUNG_GRALLOC
+/* Samsung Exynos gralloc private handle (Xclipse devices), measured on SM-S908B. Indices are into
+ * native_handle_t::data[]: the struct has a fixed fd array, so numFds does not shift them. 64-bit fields are stored as low/high int pairs.
+ */
+#define SEC_GRALLOC_MAGIC    0x59700795
+#define SEC_HND_MAGIC        5
+#define SEC_HND_WIDTH        30
+#define SEC_HND_HEIGHT       31
+#define SEC_HND_STRIDE       35 /* pixels */
+#define SEC_HND_ALLOC_FORMAT 37 /* HAL format actually allocated */
+#define SEC_HND_NUM_PLANES   39
+#define SEC_HND_PLANE0       41 /* per plane: size, offset, byte stride, alloc width, alloc height */
+#define SEC_HND_PLANE_INTS   10
+
+static uint64_t
+sec_hnd_u64(const native_handle_t *handle, int idx)
+{
+   return (uint64_t)(uint32_t)handle->data[idx] |
+          ((uint64_t)(uint32_t)handle->data[idx + 1] << 32);
+}
+
+/* Returns -ENOENT when the handle is not a Samsung gralloc handle. */
+static int
+samsung_gralloc_get_buffer_info(struct u_gralloc_buffer_handle *hnd,
+                                struct u_gralloc_buffer_basic_info *out)
+{
+   const native_handle_t *handle = hnd->handle;
+
+   if (handle->numFds + handle->numInts < SEC_HND_PLANE0 + SEC_HND_PLANE_INTS ||
+       (uint32_t)handle->data[SEC_HND_MAGIC] != SEC_GRALLOC_MAGIC)
+      return -ENOENT;
+
+   const int format = handle->data[SEC_HND_ALLOC_FORMAT];
+   const int num_planes = handle->data[SEC_HND_NUM_PLANES];
+   if (num_planes != 1 || is_hal_format_yuv(format)) {
+      mesa_loge("Samsung gralloc: unsupported format 0x%x (%d planes)", format, num_planes);
+      return -EINVAL;
+   }
+
+   const int drm_fourcc = get_fourcc_from_hal_format(format);
+   if (drm_fourcc == -1)
+      return -EINVAL;
+
+   const uint64_t width = (uint32_t)handle->data[SEC_HND_WIDTH];
+   const uint64_t height = (uint32_t)handle->data[SEC_HND_HEIGHT];
+   const uint64_t pixel_stride = (uint32_t)handle->data[SEC_HND_STRIDE];
+   const uint64_t plane_size = sec_hnd_u64(handle, SEC_HND_PLANE0);
+   const uint64_t offset = sec_hnd_u64(handle, SEC_HND_PLANE0 + 2);
+   const uint64_t alloc_w = sec_hnd_u64(handle, SEC_HND_PLANE0 + 6);
+   const uint64_t alloc_h = sec_hnd_u64(handle, SEC_HND_PLANE0 + 8);
+   uint64_t stride = sec_hnd_u64(handle, SEC_HND_PLANE0 + 4);
+
+   /* gralloc leaves the byte stride at 0 for some buffers (e.g. scanout): derive it from the
+    * pixel stride and the bytes per pixel. */
+   if (stride == 0) {
+      uint64_t bpp = get_hal_format_bpp(format);
+      if (!bpp && alloc_w && alloc_h && plane_size % (alloc_w * alloc_h) == 0)
+         bpp = plane_size / (alloc_w * alloc_h);
+      stride = pixel_stride * bpp;
+   }
+
+   /* Reject a layout that does not fit, so an unexpected handle revision fails cleanly. */
+   if (!width || pixel_stride < width || stride == 0 || stride > INT32_MAX ||
+       offset > INT32_MAX || plane_size < stride * height) {
+      mesa_loge("Samsung gralloc: inconsistent handle (format 0x%x, %" PRIu64 "x%" PRIu64
+                ", stride %" PRIu64 ", plane size %" PRIu64 ")",
+                format, width, height, stride, plane_size);
+      return -EINVAL;
+   }
+
+   out->drm_fourcc = drm_fourcc;
+   out->modifier = DRM_FORMAT_MOD_LINEAR;
+   out->num_planes = 1;
+   out->fds[0] = handle->data[0];
+   out->offsets[0] = offset;
+   out->strides[0] = stride;
+
+   return 0;
+}
+#endif /* HAS_SAMSUNG_GRALLOC */
+
 static int
 fallback_gralloc_get_yuv_info(struct u_gralloc *gralloc,
                               struct u_gralloc_buffer_handle *hnd,
@@ -226,6 +307,11 @@ fallback_gralloc_get_buffer_info(struct u_gralloc *gralloc,
    if (hnd->handle->numFds == 0)
       return -EINVAL;
 
+#ifdef HAS_SAMSUNG_GRALLOC
+   int sec_ret = samsung_gralloc_get_buffer_info(hnd, out);
+   if (sec_ret != -ENOENT)
+      return sec_ret;
+#endif
    int arm_ret = arm_gralloc_get_buffer_info(hnd, out);
    if (arm_ret != -ENOENT)
       return arm_ret;

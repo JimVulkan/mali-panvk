@@ -351,6 +351,20 @@ kbase_kmod_query_props(int fd, struct pan_kmod_dev_props *props)
     * priority kbase has not been asked for would be inventing a capability. */
    props->allowed_group_priorities_mask = PAN_KMOD_GROUP_ALLOW_PRIORITY_MEDIUM;
 
+#if defined(__aarch64__)
+   /* The GPU's SYSTEM_TIMESTAMP (what a WRITE_VALUE job stores) is the SoC's system counter, the
+    * one the CPU reads as CNTVCT_EL0, so its frequency is CNTFRQ_EL0 and the current value can
+    * be read without the kernel. */
+   uint64_t freq;
+   __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+   if (freq) {
+      props->gpu_can_query_timestamp = true;
+      props->timestamp_device_coherent = true;
+      props->timestamp_frequency = freq;
+      props->timestamp_cycles_to_ns_factor = 1000000000.0 / freq;
+   }
+#endif
+
 #undef P
 
    free(buf);
@@ -1267,7 +1281,12 @@ static void
 kbase_queue_init(struct kbase_queue *q)
 {
    pthread_mutex_init(&q->lock, NULL);
-   pthread_cond_init(&q->cond, NULL);
+   /* CLOCK_MONOTONIC, for pan_kmod_kbase_wait_seq_timeout. */
+   pthread_condattr_t attr;
+   pthread_condattr_init(&attr);
+   pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+   pthread_cond_init(&q->cond, &attr);
+   pthread_condattr_destroy(&attr);
    q->free_atoms = 255;
    q->next_seq = 1;
 }
@@ -1450,6 +1469,41 @@ pan_kmod_kbase_wait_seq(struct pan_kmod_dev *dev, uint64_t seq)
    pthread_mutex_unlock(&q->lock);
 }
 
+bool
+pan_kmod_kbase_wait_seq_timeout(struct pan_kmod_dev *dev, uint64_t seq, int64_t abs_timeout_ns)
+{
+   struct kbase_queue *q = kbase_queue(dev);
+
+   if (!seq)
+      return true;
+
+   bool done = false;
+   pthread_mutex_lock(&q->lock);
+   for (;;) {
+      bool open = false;
+      for (unsigned k = 0; k < q->nr_open_seq && !open; k++)
+         open = q->open_seq[k] <= seq;
+      if (!open) {
+         done = true;
+         break;
+      }
+      if (abs_timeout_ns == INT64_MAX) {
+         pthread_cond_wait(&q->cond, &q->lock);
+         continue;
+      }
+      struct timespec now;
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      const int64_t now_ns = (int64_t)now.tv_sec * 1000000000ll + now.tv_nsec;
+      if (now_ns >= abs_timeout_ns)
+         break;
+      const struct timespec until = {.tv_sec = abs_timeout_ns / 1000000000ll,
+                                     .tv_nsec = abs_timeout_ns % 1000000000ll};
+      pthread_cond_timedwait(&q->cond, &q->lock, &until);
+   }
+   pthread_mutex_unlock(&q->lock);
+   return done;
+}
+
 static void
 kbase_blocking_done(void *data, bool ok)
 {
@@ -1469,6 +1523,18 @@ pan_kmod_kbase_submit(struct pan_kmod_dev *dev, const struct pan_kmod_kbase_atom
    return ok;
 }
 
+static uint64_t
+kbase_kmod_query_timestamp(const struct pan_kmod_dev *dev)
+{
+#if defined(__aarch64__)
+   uint64_t v;
+   __asm__ volatile("isb\n\tmrs %0, cntvct_el0" : "=r"(v) : : "memory");
+   return v;
+#else
+   return 0;
+#endif
+}
+
 const struct pan_kmod_ops kbase_kmod_ops = {
    .dev_create = kbase_kmod_dev_create,
    .dev_destroy = kbase_kmod_dev_destroy,
@@ -1482,4 +1548,5 @@ const struct pan_kmod_ops kbase_kmod_ops = {
    .vm_create = kbase_kmod_vm_create,
    .vm_destroy = kbase_kmod_vm_destroy,
    .vm_bind = kbase_kmod_vm_bind,
+   .query_timestamp = kbase_kmod_query_timestamp,
 };

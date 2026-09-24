@@ -890,6 +890,18 @@ disk_cache_write_item_to_disk(struct disk_cache_put_job *dc_job,
  * If the mkdir param is set we create the directory if it doesn't already
  * exist, if it does not exist and the param is false NULL will be returned.
  */
+/* Xclipse (Android): see disk_cache_set_default_dir() in disk_cache.h. */
+static char disk_cache_default_dir[512];
+
+void
+disk_cache_set_default_dir(const char *dir)
+{
+   if (!dir)
+      disk_cache_default_dir[0] = '\0';
+   else
+      snprintf(disk_cache_default_dir, sizeof(disk_cache_default_dir), "%s", dir);
+}
+
 const char *
 disk_cache_generate_cache_dir(void *mem_ctx, const char *gpu_name,
                               const char *driver_id,
@@ -922,6 +934,13 @@ disk_cache_generate_cache_dir(void *mem_ctx, const char *gpu_name,
 
    if (path) {
       path = concatenate_and_mkdir(mem_ctx, path, cache_dir_name, mkdir);
+      if (!path)
+         return NULL;
+   }
+
+   /* Android: the driver-supplied app-private directory, ahead of XDG/HOME. */
+   if (path == NULL && disk_cache_default_dir[0]) {
+      path = concatenate_and_mkdir(mem_ctx, disk_cache_default_dir, cache_dir_name, mkdir);
       if (!path)
          return NULL;
    }
@@ -1018,6 +1037,11 @@ disk_cache_enabled()
    bool disable_by_default = true;
 #else
    bool disable_by_default = false;
+#endif
+#if DETECT_OS_ANDROID && !defined(SHADER_CACHE_DISABLE_BY_DEFAULT)
+   /* Xclipse: a driver that supplied a writable app-private directory opts in by default. */
+   if (disk_cache_default_dir[0])
+      disable_by_default = false;
 #endif
    char *envvar_name = "MESA_SHADER_CACHE_DISABLE";
 #if !DETECT_OS_ANDROID

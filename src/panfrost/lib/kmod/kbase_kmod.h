@@ -30,6 +30,9 @@ struct pan_kmod_dev;
  */
 #define KBASE_JD_REQ_VERTEX_TILER 0x4eu
 #define KBASE_JD_REQ_FRAGMENT     0x8001u
+/* BASE_JD_REQ_PERMON: kbase starts the cycle counter for the atom, which is also what makes the
+ * GPU's system timestamp propagate (WRITE_VALUE SYSTEM_TIMESTAMP stores 0 without it). */
+#define KBASE_JD_REQ_PERMON       0x80u
 
 /* Dependency type 1, as observed. kbase names 0 invalid, 1 data, 2 order. */
 #define KBASE_JD_DEP_DATA 1u
@@ -69,6 +72,11 @@ uint64_t pan_kmod_kbase_submit_async(struct pan_kmod_dev *dev,
 /* Wait until submission seq, and every one before it, has completed and run its callback. 0
  * waits for everything submitted so far. */
 void pan_kmod_kbase_wait_seq(struct pan_kmod_dev *dev, uint64_t seq);
+
+/* Wait for submission seq and every one before it, until abs_timeout_ns on CLOCK_MONOTONIC
+ * (INT64_MAX: no limit). True when it has completed; seq 0 (never submitted) always has. */
+bool pan_kmod_kbase_wait_seq_timeout(struct pan_kmod_dev *dev, uint64_t seq,
+                                     int64_t abs_timeout_ns);
 
 /* Submit atoms and wait for them. Returns false if the kernel refused the submission or an atom
  * completed with a fault. */

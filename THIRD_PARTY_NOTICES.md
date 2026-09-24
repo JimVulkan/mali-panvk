@@ -32,6 +32,10 @@ Text: `LICENSES/Apache-2.0.txt`
 - `include/CL/cl_va_api_media_sharing_intel.h`
 - `include/CL/cl_version.h`
 - `include/CL/opencl.h`
+- `include/EGL/egl.h`
+- `include/EGL/eglext.h`
+- `include/EGL/eglplatform.h`
+- `include/GLES/egl.h`
 - `include/GLES/glplatform.h`
 - `include/GLES2/gl2platform.h`
 - `include/GLES3/gl3platform.h`

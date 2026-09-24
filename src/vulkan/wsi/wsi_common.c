@@ -38,6 +38,7 @@
 #include "vk_semaphore.h"
 #include "vk_sync.h"
 #include "vk_sync_dummy.h"
+#include "vk_xclipse_perf.h"
 #include "vk_util.h"
 
 #include <assert.h>
@@ -2921,6 +2922,9 @@ wsi_QueuePresentKHR(VkQueue _queue, const VkPresentInfoKHR *pPresentInfo)
 {
    MESA_TRACE_FUNC();
    VK_FROM_HANDLE(vk_queue, queue, _queue);
+
+   /* Perf accounting frame boundary. Off by default; see vk_xclipse_perf.h. */
+   vk_xclipse_perf_present();
 
    return wsi_common_queue_present(queue->base.device->physical->wsi_device,
                                    queue, pPresentInfo);

@@ -249,6 +249,19 @@ struct vk_viewport_state {
     * MESA_VK_DYNAMIC_GRAPHICS_STATE_VP_SCISSORS
     */
    VkRect2D scissors[MESA_VK_MAX_SCISSORS];
+
+   /** VkPipelineViewportSwizzleStateCreateInfoNV::viewportCount
+    *
+    * Zero when VK_NV_viewport_swizzle is not in use.
+    */
+   uint8_t swizzle_count;
+
+   /** VkPipelineViewportSwizzleStateCreateInfoNV::pViewportSwizzles
+    *
+    * Stored as VkViewportCoordinateSwizzleNV values, x/y/z/w per viewport, to
+    * keep this out of the way in vk_dynamic_graphics_state.
+    */
+   uint8_t swizzles[MESA_VK_MAX_VIEWPORTS][4];
 };
 
 /***/

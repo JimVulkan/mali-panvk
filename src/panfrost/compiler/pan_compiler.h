@@ -89,6 +89,11 @@ void pan_shader_compile(nir_shader *nir, struct pan_compile_inputs *inputs,
 
 #define PAN_PRINTF_BUFFER_SIZE 16384
 
+/* Invocations per compute workgroup every Bifrost and later GPU runs,
+ * whatever the register usage.
+ */
+#define PAN_MAX_HW_WORKGROUP_SIZE 256
+
 /* Any address with the top bit set is treated OOB by the hardware when
  * accessed from a shader and any reads will return zero and writes will be
  * discarded.  Using these is sometimes preferable to control-flow in the
@@ -519,6 +524,13 @@ struct pan_shader_info {
           * Stays zero for shaders that are not built by panfrost_compile.
           */
          uint8_t precomp_num_workgroups_mask;
+
+         /* Nonzero when the workgroup was larger than the hardware runs and
+          * the shader was lowered to a 1D workgroup of this many invocations,
+          * each doing the work of several (nir_lower_workgroup_size). It has
+          * to be dispatched at this size, not the API's.
+          */
+         uint16_t real_workgroup_size;
       } cs;
    };
 
