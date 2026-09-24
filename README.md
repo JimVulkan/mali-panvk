@@ -14,8 +14,6 @@ and the Mali-G52 (Galaxy A31, MediaTek Helio P65).
   emulated with compute jobs. Indirect, indexed, instanced and multi-draw calls work with all of
   them.
 - Presentation through Android's gralloc (Arm's handle layout, including MediaTek's).
-- Minecraft Java 26.2 through its Vulkan renderer (MojoLauncher), which the stock Mali driver
-  cannot run because it only exposes Vulkan 1.1.
 
 Not done yet: BCn texture formats.
 
