@@ -13,9 +13,12 @@ and the Mali-G52 (Galaxy A31, MediaTek Helio P65).
 - Geometry shaders, tessellation and transform feedback, which Bifrost does not have in hardware,
   emulated with compute jobs. Indirect, indexed, instanced and multi-draw calls work with all of
   them.
+- `VK_EXT_robustness2` (out-of-range and null descriptor accesses read zero) and geometry
+  shader vertex streams, which DXVK requires for Direct3D 9, 10 and 11. BCn textures still have
+  to come from the app: Winlator-based emulators decode them in their Vulkan wrapper.
 - Presentation through Android's gralloc (Arm's handle layout, including MediaTek's).
 
-Not done yet: BCn texture formats.
+Not done yet: BCn texture formats, and what vkd3d-proton needs for Direct3D 12.
 
 On phones with 4 GB of RAM or less, give Minecraft about 600 MB of Java heap: GPU memory comes out
 of the same RAM, and with a 1 GB heap the system kills the game while it loads a world.
