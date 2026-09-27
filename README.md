@@ -16,7 +16,8 @@ and the Mali-G52 (Galaxy A31, MediaTek Helio P65).
 - `VK_EXT_robustness2` (out-of-range and null descriptor accesses read zero) and geometry
   shader vertex streams, which DXVK requires for Direct3D 9, 10 and 11. BCn textures still have
   to come from the app: Winlator-based emulators decode them in their Vulkan wrapper.
-- Presentation through Android's gralloc (Arm's handle layout, including MediaTek's).
+- Presentation through Android's gralloc (Arm's handle layout, including MediaTek's), and
+  Android hardware buffers shared with other apps, including MediaTek's AFBC-compressed ones.
 
 Not done yet: BCn texture formats, and what vkd3d-proton needs for Direct3D 12.
 
