@@ -58,9 +58,15 @@ static inline void regfree(regex_t* r) {}
 #include <fcntl.h>
 #include <math.h>
 #include "strndup.h"
+#include "log.h"
 #include "u_process.h"
 #include "os_file.h"
 #include "os_misc.h"
+#include "detect_os.h"
+
+#if DETECT_OS_LINUX
+#include <strings.h>
+#endif
 
 /* For systems like Hurd */
 #ifndef PATH_MAX
@@ -652,6 +658,7 @@ struct OptConfData {
    const char *driverName, *execName;
    const char *kernelDriverName;
    const char *deviceName;
+   uint32_t deviceVersion;
    const char *engineName;
    const char *applicationName;
    union {
@@ -721,11 +728,13 @@ parseDeviceAttr(struct OptConfData *data, const char **attr)
 {
    uint32_t i;
    const char *driver = NULL, *screen = NULL, *kernel = NULL, *device = NULL;
+   const char *device_version_regexp = NULL;
    for (i = 0; attr[i]; i += 2) {
       if (!strcmp(attr[i], "driver")) driver = attr[i+1];
       else if (!strcmp(attr[i], "screen")) screen = attr[i+1];
       else if (!strcmp(attr[i], "kernel_driver")) kernel = attr[i+1];
       else if (!strcmp(attr[i], "device")) device = attr[i+1];
+      else if (!strcmp(attr[i], "device_version_regexp")) device_version_regexp = attr[i+1];
       else XML_WARNING("unknown device attribute: %s.", attr[i]);
    }
    if (driver && strcmp(driver, data->driverName))
@@ -736,13 +745,100 @@ parseDeviceAttr(struct OptConfData *data, const char **attr)
    else if (device && (!data->deviceName ||
                        strcmp(device, data->deviceName)))
       data->ignoringDevice = data->inDevice;
-   else if (screen) {
+   else if (device_version_regexp) {
+      /* device_version_regexp: Extended regex pattern matching on device version.
+       * Uses POSIX extended regular expressions (ERE).
+       *
+       * Examples:
+       *   "^(40|50|60)$"       - Match exact versions 40, 50, or 60
+       *   "^[4-6][0-9]$"       - Match versions 40-69
+       *   "^12[0-9]"           - Match versions starting with 12 (120-129)
+       */
+      if (!data->deviceVersion) {
+         data->ignoringDevice = data->inDevice;
+      } else {
+         regex_t re;
+         if (regcomp(&re, device_version_regexp, REG_EXTENDED|REG_NOSUB) == 0) {
+            char device_version_str[32];
+            snprintf(device_version_str, sizeof(device_version_str), "%u", data->deviceVersion);
+
+            if (regexec(&re, device_version_str, 0, NULL, 0) == REG_NOMATCH)
+               data->ignoringDevice = data->inDevice;
+            regfree(&re);
+         } else
+            XML_WARNING("Invalid device_version_regexp=\"%s\".", device_version_regexp);
+      }
+   } else if (screen) {
       driOptionValue screenNum;
       if (!parseValue(&screenNum, DRI_INT, screen))
          XML_WARNING("illegal screen number: %s.", screen);
       else if (screenNum._int != data->screenNum)
          data->ignoringDevice = data->inDevice;
    }
+}
+
+/**
+ * Read the executable that execName refers to, for hashing.
+ *
+ * This is usually the process executable, but not under Wine: there
+ * /proc/self/exe is the wine loader, while execName comes from argv[0], which
+ * Wine sets to the PE executable (e.g. "C:\\path\\game.exe"). The PE file is
+ * mapped into the process, so find it among the mapped files instead. Falls
+ * back to the process executable when there is no better match.
+ */
+static char *
+readAppExecutable(struct OptConfData *data, size_t *len)
+{
+   char path[PATH_MAX];
+   const char *name;
+
+   if (util_get_process_exec_path(path, ARRAY_SIZE(path)) > 0) {
+      name = strrchr(path, '/');
+      name = name ? name + 1 : path;
+
+      if (!strcmp(name, data->execName))
+         return os_read_file(path, len);
+   } else {
+      path[0] = 0;
+   }
+
+#if DETECT_OS_LINUX
+   /* Not the process executable, so look for a mapped file called execName.
+    * Windows file names are case-insensitive, and argv[0] doesn't have to
+    * match the case on disk.
+    */
+   FILE *maps = fopen("/proc/self/maps", "r");
+   if (maps) {
+      char *content = NULL;
+      char *line = NULL;
+      size_t line_size = 0;
+
+      while (getline(&line, &line_size, maps) > 0) {
+         /* The only field of a maps line that can contain '/' is the path. */
+         char *mapped = strchr(line, '/');
+         if (!mapped)
+            continue;
+
+         char *end = strchr(mapped, '\n');
+         if (end)
+            *end = 0;
+
+         name = strrchr(mapped, '/') + 1;
+         if (!strcasecmp(name, data->execName)) {
+            content = os_read_file(mapped, len);
+            break;
+         }
+      }
+
+      free(line);
+      fclose(maps);
+
+      if (content)
+         return content;
+   }
+#endif
+
+   return path[0] ? os_read_file(path, len) : NULL;
 }
 
 /** \brief Parse attributes of an application element. */
@@ -789,9 +885,7 @@ parseAppAttr(struct OptConfData *data, const char **attr)
       } else {
          size_t len;
          char* content;
-         char path[PATH_MAX];
-         if (util_get_process_exec_path(path, ARRAY_SIZE(path)) > 0 &&
-             (content = os_read_file(path, &len))) {
+         if ((content = readAppExecutable(data, &len))) {
             uint8_t blake3x[BLAKE3_KEY_LEN];
             char blake3s[BLAKE3_HEX_LEN];
             _mesa_blake3_compute(content, len, blake3x);
@@ -1332,6 +1426,51 @@ driInjectExecName(const char *exec)
    execname = exec;
 }
 
+static void
+driLogNonDefaultOptions(const driOptionCache *cache,
+                        const driOptionCache *defaults,
+                        const char *tag)
+{
+   assert(cache->tableSize == defaults->tableSize);
+   assert(cache->info == defaults->info);
+
+   for (unsigned i = 0; i < (1u << cache->tableSize); i++) {
+      const driOptionInfo *info = &cache->info[i];
+      if (!info->name)
+         continue;
+
+      const driOptionValue *value = &cache->values[i];
+      const driOptionValue *default_value = &defaults->values[i];
+
+      switch (info->type) {
+      case DRI_BOOL:
+         if (value->_bool != default_value->_bool)
+            mesa_log(MESA_LOG_INFO, tag, "drirc: %s=%s", info->name,
+                     value->_bool ? "true" : "false");
+         break;
+      case DRI_ENUM:
+      case DRI_INT:
+         if (value->_int != default_value->_int)
+            mesa_log(MESA_LOG_INFO, tag, "drirc: %s=%d", info->name, value->_int);
+         break;
+      case DRI_UINT64:
+         if (value->_uint64 != default_value->_uint64)
+            mesa_log(MESA_LOG_INFO, tag, "drirc: %s=%" PRIu64, info->name, value->_uint64);
+         break;
+      case DRI_FLOAT:
+         if (value->_float != default_value->_float)
+            mesa_log(MESA_LOG_INFO, tag, "drirc: %s=%g", info->name, value->_float);
+         break;
+      case DRI_STRING:
+         if (strcmp(value->_string, default_value->_string))
+            mesa_log(MESA_LOG_INFO, tag, "drirc: %s=%s", info->name, value->_string);
+         break;
+      case DRI_SECTION:
+         break;
+      }
+   }
+}
+
 void
 driParseConfigFiles(driOptionCache *cache, const driOptionCache *info,
                     const driConfigFileParseParams *params)
@@ -1349,6 +1488,7 @@ driParseConfigFiles(driOptionCache *cache, const driOptionCache *info,
    userData.driverName = params->driverName;
    userData.kernelDriverName = params->kernelDriverName;
    userData.deviceName = params->deviceName;
+   userData.deviceVersion = params->deviceVersion;
    userData.applicationName = params->applicationName ? params->applicationName : "";
    userData.applicationVersion = params->applicationVersion;
    userData.engineName = params->engineName ? params->engineName : "";
@@ -1385,6 +1525,9 @@ driParseConfigFiles(driOptionCache *cache, const driOptionCache *info,
 #else
    parseStaticConfig(&userData);
 #endif /* WITH_XMLCONFIG */
+
+   if (params->logNonDefaultOptions)
+      driLogNonDefaultOptions(cache, info, params->driverName);
 }
 
 void

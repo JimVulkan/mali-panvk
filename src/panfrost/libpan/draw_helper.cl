@@ -10,6 +10,7 @@
 #include "lib/pan_encoder.h"
 #include "poly/cl/restart.h"
 #include "draw_helper.h"
+#include "poly/geometry.h"
 
 #if PAN_ARCH >= 10
 
@@ -69,9 +70,9 @@ panlib_update_prims_generated_query_indirect(
       cmd = (constant uint32_t *) ((uintptr_t) cmd + cmd_stride);
    }
 }
-#endif
 
-#if (PAN_ARCH == 6 || PAN_ARCH == 7)
+#elif PAN_ARCH < 9
+
 struct panlib_draw_info {
    struct {
       uint32_t size;
@@ -117,6 +118,8 @@ struct panlib_draw_info {
 
    uint64_t position;
    uint64_t psiz;
+
+   global struct poly_heap *heap;
 };
 
 static void
@@ -264,9 +267,6 @@ panlib_patch_varying_bufs(struct panlib_draw_info *draw)
    uint32_t vertex_count = draw->padded_vertex_count * draw->instance.count;
 
    for (uint32_t i = 0; i < PANLIB_VARY_BUF_MAX; i++) {
-      global struct libpan_draw_helper_varying_buf_info *info =
-         &draw->varying_bufs.info[0];
-
       global struct mali_attribute_buffer_packed *desc =
          &draw->varying_bufs.descs[i];
       pan_unpack(desc, ATTRIBUTE_BUFFER, unpacked_desc)
@@ -275,18 +275,14 @@ panlib_patch_varying_bufs(struct panlib_draw_info *draw)
       pan_pack(desc, ATTRIBUTE_BUFFER, cfg) {
          memcpy(&cfg, &unpacked_desc, sizeof(cfg));
          cfg.size = vertex_count * cfg.stride;
-
-         /* Ensure we are aligned properly */
-         uint32_t offset_add = ALIGN_POT(cfg.size, 64);
-
-         /* Allocate some space for ourself */
-         uint32_t current_offset = atomic_fetch_add_explicit(
-            &info->offset, offset_add, memory_order_relaxed);
-
-         if (current_offset + cfg.size > info->size)
+         /* poly_heap_alloc, except that a draw that does not fit is dropped (fits = false)
+          * instead of aborting the batch. */
+         uint32_t offs = atomic_fetch_add((volatile atomic_uint *)&draw->heap->bottom,
+                                          cfg.size + 64);
+         offs = ALIGN_POT(offs, 64);
+         if (offs + cfg.size > draw->heap->size)
             fits = false;
-
-         cfg.pointer = info->address + current_offset;
+         cfg.pointer = (uint64_t)(draw->heap->base + offs);
 
          if (i == PANLIB_VARY_BUF_POSITION)
             draw->position = cfg.pointer;
@@ -476,8 +472,8 @@ padded_vertex_count(uint32_t vertex_count, uint32_t instance_count, bool idvs)
 KERNEL(1)
 panlib_draw_indirect_helper(
    global VkDrawIndirectCommand *cmd,
+   global struct poly_heap *heap,
    global struct mali_attribute_buffer_packed *varying_bufs_descs,
-   global struct libpan_draw_helper_varying_buf_info *varying_bufs_info,
    global struct mali_attribute_buffer_packed *attrib_bufs_descs,
    global struct libpan_draw_helper_attrib_buf_info *attrib_bufs_infos,
    uint32_t attrib_bufs_valid, uint32_t attribs_valid,
@@ -505,7 +501,6 @@ panlib_draw_indirect_helper(
       .instance.count = instance_count,
 
       .varying_bufs.descs = varying_bufs_descs,
-      .varying_bufs.info = varying_bufs_info,
 
       .attrib_bufs.descs = attrib_bufs_descs,
       .attrib_bufs.infos = attrib_bufs_infos,
@@ -519,6 +514,8 @@ panlib_draw_indirect_helper(
       .padded_vertex_count =
          padded_vertex_count(vertex_count, instance_count, idvs_job != NULL),
       .primitive_vertex_count = primitive_vertex_count,
+
+      .heap = heap,
    };
 
    panlib_patch_draw(&draw);
@@ -534,8 +531,8 @@ panlib_draw_indexed_indirect_helper(
    global struct libpan_draw_helper_index_min_max_result *index_min_max_res,
    uint32_t index_size, uint32_t primitive_vertex_count,
    uint32_t attrib_bufs_valid, uint32_t attribs_valid,
+   global struct poly_heap *heap,
    global struct mali_attribute_buffer_packed *varying_bufs_descs,
-   global struct libpan_draw_helper_varying_buf_info *varying_bufs_info,
    global struct mali_attribute_buffer_packed *attrib_bufs_descs,
    global struct libpan_draw_helper_attrib_buf_info *attrib_bufs_infos,
    global struct mali_attribute_packed *attribs_descs,
@@ -567,7 +564,6 @@ panlib_draw_indexed_indirect_helper(
       .instance.count = instance_count,
 
       .varying_bufs.descs = varying_bufs_descs,
-      .varying_bufs.info = varying_bufs_info,
 
       .attrib_bufs.descs = attrib_bufs_descs,
       .attrib_bufs.infos = attrib_bufs_infos,
@@ -582,6 +578,8 @@ panlib_draw_indexed_indirect_helper(
          padded_vertex_count(vertex_range, instance_count, idvs_job != NULL),
       .primitive_vertex_count = primitive_vertex_count,
       .indices = index_buffer_ptr,
+
+      .heap = heap,
    };
 
    panlib_patch_draw(&draw);
@@ -735,8 +733,7 @@ panlib_draw_batch_patch(global struct libpan_draw_batch *batch)
          .tiler_job = (global uint8_t *)e->tiler_job,
 
          .varying_bufs.descs = (global struct mali_attribute_buffer_packed *)e->varying_bufs_descs,
-         .varying_bufs.info =
-            (global struct libpan_draw_helper_varying_buf_info *)e->varying_bufs_info,
+         .heap = (global struct poly_heap *)e->heap,
 
          .attrib_bufs.descs = (global struct mali_attribute_buffer_packed *)e->attrib_bufs_descs,
          .attrib_bufs.infos =
@@ -876,6 +873,9 @@ panlib_gs_restart_unroll(global VkDrawIndexedIndirectCommand *cmd, global uint8_
    out_cmd->firstInstance = cmd->firstInstance;
 }
 
+#endif
+
+#if PAN_ARCH >= 6 && PAN_ARCH <= 9
 /* Transform feedback. The geometry shader emulation left, per invocation, how many complete
  * primitives it emitted and a staging record for every vertex slot. Capture order is draw order,
  * which is invocation order, so one thread turns the counts into each invocation's first
@@ -966,6 +966,70 @@ panlib_xfb_counters(global uint32_t *offsets, uint64_t c0, uint64_t c1, uint64_t
          offsets[b] = counter ? *counter : 0;
       else if (counter)
          *counter = offsets[b];
+   }
+}
+#endif
+
+#if PAN_ARCH == 9
+/* v9 indirect draws: the counts go into the MALLOC_VERTEX job, the base vertex and instance into
+ * the vertex shader's sysvals, and firstInstance into the per-instance attribute offsets (the
+ * descriptors were built for instance 0). An empty draw becomes a NULL job. */
+KERNEL(1)
+panlib_v9_draw_indirect(global struct libpan_v9_indirect_draw *d)
+{
+   global const uint32_t *cmd = (global const uint32_t *)d->cmd;
+   const bool indexed = d->index_buffer != 0;
+   const uint32_t count = cmd[0];
+   const uint32_t instances = cmd[1];
+   const uint32_t first = cmd[2];
+   const int32_t vertex_offset = indexed ? (int32_t)cmd[3] : (int32_t)first;
+   const uint32_t first_instance = indexed ? cmd[4] : cmd[3];
+   global uint8_t *job = (global uint8_t *)d->job;
+
+   if (count == 0 || instances == 0) {
+      struct mali_job_header_packed hdr;
+      pan_pack(&hdr, JOB_HEADER, cfg) {
+         cfg.type = MALI_JOB_TYPE_NULL;
+      }
+      pan_merge((global struct mali_job_header_packed *)job, &hdr, JOB_HEADER);
+      return;
+   }
+
+   global struct mali_primitive_packed *prim =
+      (global struct mali_primitive_packed *)(job +
+                                              pan_section_offset(MALLOC_VERTEX_JOB, PRIMITIVE));
+   pan_unpack(prim, PRIMITIVE, p);
+   pan_pack(prim, PRIMITIVE, cfg) {
+      memcpy(&cfg, &p, sizeof(cfg));
+      cfg.index_count = count;
+      cfg.base_vertex_offset = vertex_offset;
+   }
+
+   pan_pack((global struct mali_count_packed *)(job + pan_section_offset(
+                                                         MALLOC_VERTEX_JOB, INSTANCE_COUNT)),
+            COUNT, cfg) {
+      cfg.count = instances;
+   }
+
+   if (indexed) {
+      pan_pack((global struct mali_indices_packed *)(job + pan_section_offset(
+                                                              MALLOC_VERTEX_JOB, INDICES)),
+               INDICES, cfg) {
+         cfg.address = d->index_buffer + (uint64_t)first * d->index_size;
+      }
+   }
+
+   if (d->first_vertex_sysval)
+      *(global uint32_t *)d->first_vertex_sysval = vertex_offset;
+   if (d->base_instance_sysval)
+      *(global uint32_t *)d->base_instance_sysval = first_instance;
+
+   if (first_instance) {
+      global uint32_t *attribs = (global uint32_t *)d->attribs;
+      for (uint32_t i = 0; i < 16; i++) {
+         if (d->patch_attribs & (1u << i))
+            attribs[i * 8 + 2] += first_instance * d->strides[i];
+      }
    }
 }
 #endif

@@ -447,6 +447,7 @@ unop("fquantize2f16", tfloat32, "(fabsf(src0) < ldexpf(1.0, -14)) ? copysignf(0.
 
 unop("fsin", tfloat, "bit_size == 64 ? sin(src0) : sinf(src0)")
 unop("fcos", tfloat, "bit_size == 64 ? cos(src0) : cosf(src0)")
+unop("ftanh", tfloat, "bit_size == 64 ? tanh(src0) : tanhf(src0)")
 
 # dfrexp
 unop_convert("frexp_exp", tint32, tfloat, "frexp(src0, &dst);", valid_fp_math_ctrl = preserve_inf + preserve_nan + exact)
@@ -868,17 +869,18 @@ binop("fdiv", tfloat, "", "src0 / src1")
 binop("idiv", tint, "", "(src1 == 0 || (src0 == u_intN_min(bit_size) && src1 == -1)) ? 0 : (src0 / src1)")
 binop("udiv", tuint, "", "src1 == 0 ? 0 : (src0 / src1)")
 
-binop_convert("uadd_carry", tuint, tuint, _2src_commutative,
-              "util_add_check_overflow({dest_type}, src0, src1)",
-              description = """
-Return an integer (1 or 0) representing the carry resulting from the
-addition of the two unsigned arguments.
-              """, needs_dest_type = True)
+opcode("uadd_with_carry_out", 2, tuint, [1, 1], [tuint, tuint],
+       False, _2src_commutative, """
+   dst.x = src0.x + src1.x;
+   dst.y = util_add_check_overflow({dest_type}, src0.x,  src1.x);
+""", needs_dest_type = True)
 
-binop_convert("usub_borrow", tuint, tuint, "", "src0 < src1", description = """
-Return an integer (1 or 0) representing the borrow resulting from the
-subtraction of the two unsigned arguments.
-              """)
+opcode("usub_with_borrow_out", 2, tuint, [1, 1], [tuint, tuint],
+       False, "", """
+   dst.x = src0.x - src1.x;
+   dst.y = src0.x < src1.x;
+""")
+
 
 # hadd: (a + b) >> 1 (without overflow)
 # x + y = x - (x & ~y) + (x & ~y) + y - (~x & y) + (~x & y)

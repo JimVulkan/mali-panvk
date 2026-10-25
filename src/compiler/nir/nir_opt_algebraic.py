@@ -716,6 +716,13 @@ for i in [1, 2, 16, 24]:
     ])
 
 optimizations.extend([
+   # Common, more generic versions of the patterns above that can happen
+   # after lowering IO to byte addresses.
+   (('ishl@32', ('iand', a, 0x3fffffff), '#b(is_first_5_bits_uge_2)'), ('ishl', a, b)),
+   (('ishl@32', ('iand', a, 0x7fffffff), '#b(is_5lsb_not_zero)'), ('ishl', a, b)),
+   (('ishl@32', ('ushr', 'a(is_unsigned_multiple_of_4)', 2), '#b(is_first_5_bits_uge_2)'), ('ishl', a, ('isub', b, 2))),
+   (('ishl@32', ('ushr', 'a(is_unsigned_multiple_of_2)', 1), '#b(is_5lsb_not_zero)'), ('ishl', a, ('isub', b, 1))),
+
    # This is common for address calculations.  Reassociating may enable the
    # 'a<<c' to be CSE'd.  It also helps architectures that have an ISHLADD
    # instruction or a constant offset field for in load / store instructions.
@@ -2146,7 +2153,7 @@ optimizations.extend([
    (('u2u8', ('ushr', a, 8)), ('u2u8', ('extract_u8', a, 1)), '!options->lower_extract_byte'),
 
    # Common pattern after lowering 8-bit integers to 16-bit.
-   (('i2i16', ('u2u8', ('extract_u8', a, b))), ('i2i16', ('extract_i8', a, b))),
+   (('i2i16', ('u2u8', ('extract_u8', a, b))), ('u2u16', ('extract_i8', a, b))),
    (('u2u16', ('u2u8', ('extract_u8', a, b))), ('u2u16', ('extract_u8', a, b))),
 
    (('ubfe', a,  0, 8), ('extract_u8', a, 0), '!options->lower_extract_byte'),
@@ -2499,11 +2506,9 @@ optimizations.extend([
    # Misc. lowering
    (('fmod', a, b), ('fsub', a, ('fmul', b, ('ffloor', ('fdiv', a, b)))), 'options->lower_fmod'),
    (('frem', a, b), ('fsub', a, ('fmul', b, ('ftrunc', ('fdiv', a, b)))), 'options->lower_fmod'),
-   (('uadd_carry', a, b), ('b2i', ('ult', ('iadd', a, b), a)), 'options->lower_uadd_carry'),
-   (('usub_borrow', a, b), ('b2i', ('ult', a, b)), 'options->lower_usub_borrow'),
 
    # hand-rolled iadd64
-   (('vec2', ('iadd@32', a, c), ('iadd', ('iadd', b, d), ('uadd_carry', a, c))),
+   (('vec2', ('iadd@32', a, c), ('iadd', ('iadd', b, d), ('b2i', ('ult', ('iadd', a, c), a)))),
      ('unpack_64_2x32', ('iadd', ('pack_64_2x32_split', a, b), ('pack_64_2x32_split', c, d))), '!(options->lower_int64_options & nir_lower_iadd64)'),
 
    (('ihadd', a, b), ('iadd', ('iand', a, b), ('ishr', ('ixor', a, b), 1)), 'options->lower_hadd'),
@@ -2867,7 +2872,7 @@ optimizations.extend([
    (('imul24', a, '#b@32(is_neg_power_of_two)'), ('ineg', ('ishl', a, ('find_lsb', ('iabs', b)))), '!options->lower_bitops'),
    (('imul24', a, 0), (0)),
 
-   (('imul_high@16', a, b), ('i2i16', ('ishr', ('imul24_relaxed', ('i2i32', a), ('i2i32', b)), 16)), 'options->lower_mul_high16'),
+   (('imul_high@16', a, b), ('u2u16', ('ishr', ('imul24_relaxed', ('i2i32', a), ('i2i32', b)), 16)), 'options->lower_mul_high16'),
    (('umul_high@16', a, b), ('u2u16', ('ushr', ('umul24_relaxed', ('u2u32', a), ('u2u32', b)), 16)), 'options->lower_mul_high16'),
 
    # Optimize vec2 unsigned comparison predicates to usub_sat with clamp.
@@ -2891,8 +2896,6 @@ for bit_size in [8, 16, 32, 64]:
    optimizations += [
       (('bcsel', ('ult', ('iadd', a, b), a), -1, (add, a, b)), ('uadd_sat', a, b), cond),
       (('bcsel', ('uge', ('iadd', a, b), a), (add, a, b), -1), ('uadd_sat', a, b), cond),
-      (('bcsel', ('ieq', ('uadd_carry', a, b), 0), (add, a, b), -1), ('uadd_sat', a, b), cond),
-      (('bcsel', ('ine', ('uadd_carry', a, b), 0), -1, (add, a, b)), ('uadd_sat', a, b), cond),
    ]
 
 optimizations += [
@@ -2965,8 +2968,6 @@ for bit_size in [8, 16, 32, 64]:
    optimizations += [
       (('bcsel', ('ult', a, b), 0, (add, a, ('ineg', b))), ('usub_sat', a, b), cond),
       (('bcsel', ('uge', a, b), (add, a, ('ineg', b)), 0), ('usub_sat', a, b), cond),
-      (('bcsel', ('ieq', ('usub_borrow', a, b), 0), (add, a, ('ineg', b)), 0), ('usub_sat', a, b), cond),
-      (('bcsel', ('ine', ('usub_borrow', a, b), 0), 0, (add, a, ('ineg', b))), ('usub_sat', a, b), cond),
    ]
 
 # bit_size dependent lowerings
@@ -3021,15 +3022,28 @@ for t in ['int', 'uint', 'float', 'bool']:
 # upcasts where the type differs from the other cast
 for N, M in itertools.product(type_sizes('uint'), type_sizes('uint')):
    if N < M:
-      # The outer cast is a down-cast.  It doesn't matter what the size of the
-      # argument of the inner cast is because we'll never been in the upcast
-      # of downcast case.  Regardless of types, we'll always end up with y2yN
-      # in the end.
-      for x, y in itertools.product(['i', 'u'], ['i', 'u']):
-         x2xN = '{0}2{0}{1}'.format(x, N)
-         y2yM = '{0}2{0}{1}'.format(y, M)
-         y2yN = '{0}2{0}{1}'.format(y, N)
-         optimizations.append(((x2xN, (y2yM, a)), (y2yN, a)))
+      # Down-casts are always in the u2uN form
+      u2uN = 'u2u{0}'.format(N)
+
+      if N == 1:
+         for y in ['i', 'u']:
+            y2yM = '{0}2{0}{1}'.format(y, M)
+            optimizations.append(((u2uN, (y2yM, a)), (u2uN, a)))
+         continue
+
+      u2uM = 'u2u{0}'.format(M)
+      optimizations.append(((u2uN, (u2uM, a)), (u2uN, a)))
+
+      for P in type_sizes('uint'):
+         if P > M:
+            continue
+
+         # Keep the sign extension for down-casts of signed up-casts.
+         res = u2uN if P >= N else 'i2i{0}'.format(N)
+
+         i2iM = 'i2i{0}'.format(M)
+         aP = 'a@{0}'.format(P)
+         optimizations.append(((u2uN, (i2iM, aP)), (res, a)))
    elif N > M:
       # If the outer cast is an up-cast, we have to be more careful about the
       # size of the argument of the inner cast and with types.  In this case,
@@ -3132,16 +3146,6 @@ for t in ['int', 'uint', 'float']:
                           ('ior', (xge, a, xN_max), (xge, (x2xN, a), b))), cond),
             ]
 
-# Convert masking followed by signed downcast to just unsigned downcast
-optimizations += [
-    (('i2i32', ('iand', 'a@64', 0xffffffff)), ('u2u32', a)),
-    (('i2i16', ('iand', 'a@32', 0xffff)), ('u2u16', a)),
-    (('i2i16', ('iand', 'a@64', 0xffff)), ('u2u16', a)),
-    (('i2i8', ('iand', 'a@16', 0xff)), ('u2u8', a)),
-    (('i2i8', ('iand', 'a@32', 0xff)), ('u2u8', a)),
-    (('i2i8', ('iand', 'a@64', 0xff)), ('u2u8', a)),
-]
-
 # Optimize fmin/fmax with constant followed by conversion to 16bit
 # Assume 16bit fmin/fmax is faster.
 for f2f16 in ['f2f16', 'f2f16_rtz', 'f2f16_rtne']:
@@ -3200,7 +3204,6 @@ for N in [16, 32]:
 
         aN = 'a@' + str(N)
         u2uM = 'u2u{0}'.format(M)
-        i2iM = 'i2i{0}'.format(M)
 
         for x in ['u', 'i']:
             x2xN = '{0}2{0}{1}'.format(x, N)
@@ -3217,7 +3220,6 @@ for N in [16, 32]:
             bcsel_M_bits = 'bcsel(only_lower_{0}_bits_used)'.format(M)
             optimizations += [
                 ((bcsel_M_bits, c, (x2xN, (u2uM, aN)), b), ('bcsel', c, a, b)),
-                ((bcsel_M_bits, c, (x2xN, (i2iM, aN)), b), ('bcsel', c, a, b)),
                 ((bcsel_M_bits, c, (extract_xM, aN, 0), b), ('bcsel', c, a, b)),
             ]
 
@@ -3225,7 +3227,6 @@ for N in [16, 32]:
                 op_M_bits = '{0}(only_lower_{1}_bits_used)'.format(op, M)
                 optimizations += [
                     ((op_M_bits, (x2xN, (u2uM, aN)), b), (op, a, b)),
-                    ((op_M_bits, (x2xN, (i2iM, aN)), b), (op, a, b)),
                     ((op_M_bits, (extract_xM, aN, 0), b), (op, a, b)),
                 ]
 
@@ -3241,7 +3242,7 @@ def fexp2i(exp, bits):
    # If exp is the lowest value in the valid range, a value of 0.0 is
    # constructed.  Otherwise, the value 2.0^exp is constructed.
    if bits == 16:
-      return ('i2i16', ('ishl', ('iadd', exp, 15), 10))
+      return ('u2u16', ('ishl', ('iadd', exp, 15), 10))
    elif bits == 32:
       return ('ishl', ('iadd', exp, 127), 23)
    elif bits == 64:
@@ -3746,8 +3747,12 @@ late_optimizations = [
    # Since b2i(inot(a)) == 1 - b2i(a), 1 - b2i(inot(a)) == b2i(a).
    (('iadd3', a,          ('b2i', ('inot', b)),  -1), ('iadd', a, ('ineg', ('b2i', b)))),
    (('iadd3', a, ('ineg', ('b2i', ('inot', b))),  1), ('iadd', a,          ('b2i', b) )),
-   (('iadd', a, ('ineg', ('b2i', ('inot', b)))), ('iadd3', a,          ('b2i', b) , -1), 'options->has_iadd3'),
-   (('iadd', a,          ('b2i', ('inot', b)) ), ('iadd3', a, ('ineg', ('b2i', b)),  1), 'options->has_iadd3'),
+   (('iadd@16', a, ('ineg', ('b2i', ('inot', b)))), ('iadd3', a,          ('b2i', b) , -1), 'options->has_iadd3'),
+   (('iadd@16', a,          ('b2i', ('inot', b)) ), ('iadd3', a, ('ineg', ('b2i', b)),  1), 'options->has_iadd3'),
+   (('iadd@32', a, ('ineg', ('b2i', ('inot', b)))), ('iadd3', a,          ('b2i', b) , -1), 'options->has_iadd3'),
+   (('iadd@32', a,          ('b2i', ('inot', b)) ), ('iadd3', a, ('ineg', ('b2i', b)),  1), 'options->has_iadd3'),
+   (('iadd@64', a, ('ineg', ('b2i', ('inot', b)))), ('iadd3', a,          ('b2i', b) , -1), 'options->has_iadd3 && !(options->lower_int64_options & nir_lower_iadd3_64)'),
+   (('iadd@64', a,          ('b2i', ('inot', b)) ), ('iadd3', a, ('ineg', ('b2i', b)),  1), 'options->has_iadd3 && !(options->lower_int64_options & nir_lower_iadd3_64)'),
 ]
 
 for int_sz in (8, 16, 32):
@@ -4106,7 +4111,6 @@ late_optimizations += [
 for N in [16, 32]:
     aN = 'a@{0}'.format(N)
     u2uM = 'u2u{0}'.format(M)
-    i2iM = 'i2i{0}'.format(M)
 
     for x in ['u', 'i']:
         x2xN = '{0}2{0}{1}'.format(x, N)
@@ -4115,13 +4119,11 @@ for N in [16, 32]:
 
         late_optimizations.extend([
             ((x2xN, ('u2u8', aN)), (extract_x8, a, 0), '!options->lower_extract_byte'),
-            ((x2xN, ('i2i8', aN)), (extract_x8, a, 0), '!options->lower_extract_byte'),
         ])
 
         if N > 16:
             late_optimizations.extend([
                 ((x2xN, ('u2u16', aN)), (extract_x16, a, 0), '!options->lower_extract_word'),
-                ((x2xN, ('i2i16', aN)), (extract_x16, a, 0), '!options->lower_extract_word'),
             ])
 
 # Byte insertion
@@ -4201,7 +4203,6 @@ late_optimizations += [
   (('f2fmp', a), ('f2f16', a), "!options->preserve_mediump", TestStatus.UNSUPPORTED),
   (('f2imp', a), ('f2i16', a), "!options->preserve_mediump", TestStatus.UNSUPPORTED),
   (('f2ump', a), ('f2u16', a), "!options->preserve_mediump", TestStatus.UNSUPPORTED),
-  (('i2imp', a), ('i2i16', a), "!options->preserve_mediump", TestStatus.UNSUPPORTED),
   (('i2fmp', a), ('i2f16', a), "!options->preserve_mediump", TestStatus.UNSUPPORTED),
   (('i2imp', a), ('u2u16', a), "!options->preserve_mediump", TestStatus.UNSUPPORTED),
   (('u2fmp', a), ('u2f16', a), "!options->preserve_mediump", TestStatus.UNSUPPORTED),

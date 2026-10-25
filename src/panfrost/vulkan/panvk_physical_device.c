@@ -30,6 +30,7 @@
 #include "vk_util.h"
 
 #include "panvk_android.h"
+#include "panvk_bc_emu.h"
 #include "panvk_device.h"
 #include "panvk_entrypoints.h"
 #include "panvk_image.h"
@@ -69,7 +70,9 @@
 
 PER_ARCH_FUNCS(6);
 PER_ARCH_FUNCS(7);
+PER_ARCH_FUNCS(9);
 PER_ARCH_FUNCS(10);
+PER_ARCH_FUNCS(11);
 PER_ARCH_FUNCS(12);
 PER_ARCH_FUNCS(13);
 PER_ARCH_FUNCS(14);
@@ -79,39 +82,15 @@ create_kmod_dev(struct panvk_physical_device *device,
                 const struct panvk_instance *instance, drmDevicePtr drm_device)
 {
    /* A NULL drm_device means the kbase path: a stock Arm Android device has no /dev/dri at all,
-    * and its GPU is ARM's proprietary kbase at PANVK_KBASE_PATH. There is no DRM version to
-    * query there, so the driver-name check is skipped and pan_kmod_dev_create identifies the
-    * node itself (it falls through to the kbase backend when drmGetVersion fails). */
+    * and its GPU is ARM's proprietary kbase at PANVK_KBASE_PATH. pan_kmod_dev_create identifies
+    * the node itself. */
    const char *path =
       drm_device ? drm_device->nodes[DRM_NODE_RENDER] : PANVK_KBASE_PATH;
-   int fd;
-
-   fd = open(path, O_RDWR | O_CLOEXEC);
+   int fd = open(path, O_RDWR | O_CLOEXEC);
    if (fd < 0) {
       return panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
-                          "failed to open device %s", path);
+                          "failed to open device '%s'", path);
    }
-
-   if (drm_device) {
-      drmVersionPtr version = drmGetVersion(fd);
-      if (!version) {
-         close(fd);
-         return panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
-                             "failed to query kernel driver version for device %s",
-                             path);
-      }
-
-      if (strcmp(version->name, "panfrost") && strcmp(version->name, "panthor")) {
-         drmFreeVersion(version);
-         close(fd);
-         return VK_ERROR_INCOMPATIBLE_DRIVER;
-      }
-
-      drmFreeVersion(version);
-   }
-
-   if (PANVK_DEBUG(STARTUP))
-      mesa_logi("Found compatible device '%s'.", path);
 
    uint32_t flags = PAN_KMOD_DEV_FLAG_OWNS_FD;
 
@@ -119,12 +98,18 @@ create_kmod_dev(struct panvk_physical_device *device,
       flags |= PAN_KMOD_DEV_FLAG_MMAP_SYNC_THROUGH_KERNEL;
 
    device->kmod.dev = pan_kmod_dev_create(fd, flags, &instance->kmod.allocator);
-
    if (!device->kmod.dev) {
       close(fd);
+
+      if (errno != -ENOMEM)
+         return VK_ERROR_INCOMPATIBLE_DRIVER;
+
       return panvk_errorf(instance, VK_ERROR_OUT_OF_HOST_MEMORY,
                           "cannot create device");
    }
+
+   if (PANVK_DEBUG(STARTUP))
+      mesa_logi("Found compatible device '%s'.", path);
 
    return VK_SUCCESS;
 }
@@ -284,6 +269,15 @@ get_device_heaps(struct panvk_physical_device *device,
       };
    }
 
+   assert(device->memory.type_count < ARRAY_SIZE(device->memory.types));
+   host_coherent_not_cached_idx = device->memory.type_count;
+   device->memory.types[device->memory.type_count++] = (VkMemoryType){
+      .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+      .heapIndex = 0,
+   };
+
    if (!PANVK_DEBUG(NO_WB_MMAP) &&
        (device->kmod.dev->props.supported_bo_flags & PAN_KMOD_BO_FLAG_WB_MMAP)) {
       assert(device->memory.type_count < ARRAY_SIZE(device->memory.types));
@@ -296,29 +290,18 @@ get_device_heaps(struct panvk_physical_device *device,
       };
    }
 
-   assert(device->memory.type_count < ARRAY_SIZE(device->memory.types));
-   host_coherent_not_cached_idx = device->memory.type_count;
-   device->memory.types[device->memory.type_count++] = (VkMemoryType) {
-      .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
-                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-      .heapIndex = 0,
-   };
-
    /* Ideally, we'd place HOST_CACHED first for perf reasons, but there's
     * so many broken CTS tests (missing or invalid flush/invalidate
     * calls), and so many added at each version that it gets impossible to
     * catch up. So, keep things ordered in a way that the first HOST_VISIBLE
     * type is also the one requiring no CPU cache maintenance if we're asked
-    * to.
+    * to. The cached_before_coherent debug option is left to help investigate
+    * cpu cache related perf issues.
     */
-   /* On kbase the cached type is new, and the apps that run here were written against drivers
-    * without it: put the type that needs no cache maintenance first, so an app that takes the
-    * first HOST_VISIBLE type and never flushes keeps working. */
-   if ((PANVK_DEBUG(COHERENT_BEFORE_CACHED) || pan_kmod_dev_is_kbase(device->kmod.dev)) &&
+   if (PANVK_DEBUG(CACHED_BEFORE_COHERENT) &&
        host_cached_not_coherent_idx != -1 &&
        host_coherent_not_cached_idx != -1 &&
-       host_coherent_not_cached_idx > host_cached_not_coherent_idx) {
+       host_coherent_not_cached_idx < host_cached_not_coherent_idx) {
       VkMemoryType host_cached_not_coherent_type =
          device->memory.types[host_cached_not_coherent_idx];
 
@@ -343,16 +326,8 @@ get_device_sync_types(struct panvk_physical_device *device,
    const unsigned arch = pan_arch(device->kmod.dev->props.gpu_id);
    uint32_t sync_type_count = 0;
 
-   if (pan_kmod_dev_is_kbase(device->kmod.dev)) {
-      /* kbase has no syncobjs; the kmod keeps them in the process (pan_kmod_kbase_sync_provider). */
-      struct util_sync_provider *sync = pan_kmod_kbase_sync_provider();
-      device->drm_syncobj_type = sync ? vk_drm_syncobj_get_type_from_provider(sync)
-                                      : (struct vk_sync_type){0};
-      if (sync)
-         sync->finalize(sync);
-   } else {
-      device->drm_syncobj_type = vk_drm_syncobj_get_type(device->kmod.dev->fd);
-   }
+   device->drm_syncobj_type = vk_drm_syncobj_get_type_from_provider(device->kmod.dev->sync_ops);
+
    if (!device->drm_syncobj_type.features) {
       return vk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
                        "failed to query syncobj features");
@@ -360,7 +335,9 @@ get_device_sync_types(struct panvk_physical_device *device,
 
    device->sync_types[sync_type_count++] = &device->drm_syncobj_type;
 
-   if (arch >= 10) {
+   /* kbase's in-process syncobjs are binary, on CSF parts too: timelines are emulated there as
+    * on the JM ones. */
+   if (arch >= 10 && !pan_kmod_dev_is_kbase(device->kmod.dev)) {
       assert(device->drm_syncobj_type.features & VK_SYNC_FEATURE_TIMELINE);
    } else {
       /* We don't support timelines in the uAPI yet and we don't want it getting
@@ -413,8 +390,12 @@ panvk_physical_device_init(struct panvk_physical_device *device,
    if (result != VK_SUCCESS)
       return result;
 
+   unsigned core_count =
+      pan_query_core_count(&device->kmod.dev->props);
    device->model = pan_get_model(device->kmod.dev->props.gpu_id,
-                                 device->kmod.dev->props.gpu_variant);
+                                 device->kmod.dev->props.gpu_variant,
+                                 core_count,
+                                 device->kmod.dev->props.gpu_features);
 
    unsigned arch = pan_arch(device->kmod.dev->props.gpu_id);
 
@@ -429,6 +410,8 @@ panvk_physical_device_init(struct panvk_physical_device *device,
    switch (arch) {
    case 6:
    case 7:
+   case 9:
+   case 11:
    case 14:
       /* Upstream refuses these outright unless PAN_I_WANT_A_BROKEN_VULKAN_DRIVER is set. This
        * tree keeps the warning and continues, because an app loader has no way to set an
@@ -457,11 +440,7 @@ panvk_physical_device_init(struct panvk_physical_device *device,
    device->formats.all = pan_format_table(arch);
    device->formats.blendable = pan_blendable_format_table(arch);
 
-   unsigned core_count =
-      pan_query_core_count(&device->kmod.dev->props);
-
-   memset(device->name, 0, sizeof(device->name));
-   sprintf(device->name, "%s MC%u", device->model->name, core_count);
+   pan_model_device_name(device->name, sizeof(device->name), device->model, core_count, "");
 
    result = get_core_masks(device, instance);
    if (result != VK_SUCCESS)
@@ -625,6 +604,12 @@ panvk_GetPhysicalDeviceQueueFamilyProperties2(
             vk_find_struct(p->pNext, QUEUE_FAMILY_GLOBAL_PRIORITY_PROPERTIES_KHR);
          if (prio)
             panvk_fill_global_priority(physical_device, family, prio);
+
+         VkQueueFamilyOptimalImageTransferGranularityPropertiesKHR *gran =
+            vk_find_struct(p->pNext,
+                           QUEUE_FAMILY_OPTIMAL_IMAGE_TRANSFER_GRANULARITY_PROPERTIES_KHR);
+         if (gran)
+            gran->optimalImageTransferGranularity = (VkExtent3D){1, 1, 1};
       }
    }
 }
@@ -757,10 +742,10 @@ panvk_GetPhysicalDeviceMemoryProperties2(
           physical_device->memory.types[i];
    }
 
-   vk_foreach_struct(ext, pMemoryProperties->pNext) {
-      switch (ext->sType) {
+   vk_foreach_struct(sType, ext, pMemoryProperties->pNext) {
+      switch (sType) {
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT: {
-         VkPhysicalDeviceMemoryBudgetPropertiesEXT *p = (void *)ext;
+         VkPhysicalDeviceMemoryBudgetPropertiesEXT *p = ext;
 
          uint64_t used = p_atomic_read(&physical_device->memory.heap_used);
          uint64_t heap_size = physical_device->memory.heaps[0].size;
@@ -793,7 +778,7 @@ panvk_GetPhysicalDeviceMemoryProperties2(
          break;
       }
       default:
-         vk_debug_ignored_stype(ext->sType);
+         vk_debug_ignored_stype(sType);
          break;
       }
    }
@@ -878,7 +863,10 @@ get_image_plane_format_features(struct panvk_physical_device *physical_device,
    const struct pan_format fmt = physical_device->formats.all[pfmt];
    unsigned arch = pan_arch(physical_device->kmod.dev->props.gpu_id);
 
-   if (!format_is_supported(physical_device, fmt, pfmt))
+   /* BC4-BC7 are emulated where the texture unit has no decoder for them (panvk_bc_emu.h). Their
+    * features are those of any compressed format here: sampled, filtered, transfer, blit source. */
+   const bool bc_emu = panvk_bc_emu_format(physical_device, format);
+   if (!bc_emu && !format_is_supported(physical_device, fmt, pfmt))
       return 0;
 
    if (fmt.bind & PAN_BIND_SAMPLER_VIEW) {
@@ -928,7 +916,8 @@ get_image_plane_format_features(struct panvk_physical_device *physical_device,
    if (fmt.bind & PAN_BIND_DEPTH_STENCIL)
       features |= VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT;
 
-   if (features != 0)
+   /* Not for emulated BC: a host copy would not refill the hidden plane. */
+   if (features != 0 && !bc_emu)
       features |= VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT;
 
    return features;
@@ -1105,13 +1094,27 @@ get_buffer_format_features(struct panvk_physical_device *physical_device,
    return features;
 }
 
+static uint32_t
+panvk_get_mod_format_caps(const struct panvk_physical_device *pdev,
+                          enum pipe_format pfmt, uint64_t mod)
+{
+   const unsigned arch = pan_arch(pdev->kmod.dev->props.gpu_id);
+   const struct pan_mod_handler *mod_handler = pan_mod_get_handler(arch, mod);
+   if (!mod_handler)
+      return 0;
+
+   if (drm_is_afbc(mod) && PANVK_DEBUG(WSI_NO_AFBC))
+      return 0;
+
+   return mod_handler->get_format_caps(&pdev->kmod.dev->props, pfmt, mod);
+}
+
 VKAPI_ATTR void VKAPI_CALL
 panvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
                                          VkFormat format,
                                          VkFormatProperties2 *pFormatProperties)
 {
    VK_FROM_HANDLE(panvk_physical_device, physical_device, physicalDevice);
-   const unsigned arch = pan_arch(physical_device->kmod.dev->props.gpu_id);
 
    VkFormatFeatureFlags2 tex =
       get_image_format_features(physical_device, format);
@@ -1137,89 +1140,82 @@ panvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
    }
 
    const uint32_t plane_count = vk_format_get_plane_count(format);
+   enum pipe_format pfmt = vk_format_to_pipe_format(format);
 
    PAN_SUPPORTED_MODIFIERS(supported);
-   uint64_t afbc_modifiers[ARRAY_SIZE(supported)];
-   uint32_t afbc_modifier_count = 0;
-   if (PANVK_DEBUG(WSI_AFBC) &&
-         pan_afbc_supports_format(arch, vk_format_to_pipe_format(format))) {
-      for (uint32_t mi = 0; mi < ARRAY_SIZE(supported); mi++) {
-         if (drm_is_afbc(supported[mi]))
-            afbc_modifiers[afbc_modifier_count++] = supported[mi];
-      }
-   }
    VkDrmFormatModifierPropertiesListEXT *list = vk_find_struct(
       pFormatProperties->pNext, DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT);
    if (list) {
-      VkFormatFeatureFlags optimal_features =
-         pFormatProperties->formatProperties.optimalTilingFeatures;
-      VkFormatFeatureFlags linear_features =
-         pFormatProperties->formatProperties.linearTilingFeatures;
-
       VK_OUTARRAY_MAKE_TYPED(VkDrmFormatModifierPropertiesEXT, out,
                               list->pDrmFormatModifierProperties,
                               &list->drmFormatModifierCount);
 
-      if (optimal_features) {
-         /* Multi-planar AFBC is not supported. */
-         assert(!afbc_modifier_count || plane_count == 1);
+      if (tex) {
+         for (uint32_t mi = 0; mi < ARRAY_SIZE(supported); mi++) {
+            uint64_t mod = supported[mi];
+            uint32_t caps =
+               panvk_get_mod_format_caps(physical_device, pfmt, mod);
 
-         for (uint32_t i = 0; i < afbc_modifier_count; i++) {
+            if (!(caps & PAN_MOD_FORMAT_CAP_WSI))
+               continue;
+
+            VkFormatFeatureFlags mod_features =
+               pFormatProperties->formatProperties.optimalTilingFeatures;
+            if (!(caps & PAN_MOD_FORMAT_CAP_DEPTH_STENCIL))
+               mod_features &= ~VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
+            if (!(caps & PAN_MOD_FORMAT_CAP_STORAGE_IMAGE))
+               mod_features &= ~VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+
             vk_outarray_append_typed(VkDrmFormatModifierPropertiesEXT, &out,
                                        mod_props)
             {
-               mod_props->drmFormatModifier = afbc_modifiers[i];
+               mod_props->drmFormatModifier = mod;
                mod_props->drmFormatModifierPlaneCount = plane_count;
-               mod_props->drmFormatModifierTilingFeatures = optimal_features;
+               mod_props->drmFormatModifierTilingFeatures = mod_features;
             }
          }
       }
 
-      if (linear_features) {
-         vk_outarray_append_typed(VkDrmFormatModifierPropertiesEXT, &out,
-                                    mod_props)
-         {
-            mod_props->drmFormatModifier = DRM_FORMAT_MOD_LINEAR;
-            mod_props->drmFormatModifierPlaneCount = plane_count;
-            mod_props->drmFormatModifierTilingFeatures = linear_features;
-         }
-      }
    }
    VkDrmFormatModifierPropertiesList2EXT *list2 = vk_find_struct(
       pFormatProperties->pNext, DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT);
    if (list2) {
-      VkFormatFeatureFlags2 optimal_features2 = tex;
-      VkFormatFeatureFlags2 linear_features2 = tex;
-
       VK_OUTARRAY_MAKE_TYPED(VkDrmFormatModifierProperties2EXT, out,
                               list2->pDrmFormatModifierProperties,
                               &list2->drmFormatModifierCount);
 
-      if (optimal_features2) {
-         /* Multi-planar AFBC is not supported. */
-         assert(!afbc_modifier_count || plane_count == 1);
+      if (tex) {
+         for (uint32_t mi = 0; mi < ARRAY_SIZE(supported); mi++) {
+            uint64_t mod = supported[mi];
+            uint32_t caps =
+               panvk_get_mod_format_caps(physical_device, pfmt, mod);
 
-         for (uint32_t i = 0; i < afbc_modifier_count; i++) {
+            if (!(caps & PAN_MOD_FORMAT_CAP_WSI))
+               continue;
+
+            VkFormatFeatureFlags2 mod_features = tex;
+            if (!(caps & PAN_MOD_FORMAT_CAP_DEPTH_STENCIL))
+               mod_features &= ~VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT;
+            if (!(caps & PAN_MOD_FORMAT_CAP_HOST_COPY))
+               mod_features &= ~VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT;
+            if (!(caps & PAN_MOD_FORMAT_CAP_STORAGE_IMAGE)) {
+               mod_features &=
+                  ~(VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
+                    VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
+                    VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT |
+                    VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT);
+            }
+
             vk_outarray_append_typed(VkDrmFormatModifierProperties2EXT, &out,
                                        mod_props)
             {
-               mod_props->drmFormatModifier = afbc_modifiers[i];
+               mod_props->drmFormatModifier = mod;
                mod_props->drmFormatModifierPlaneCount = plane_count;
-               mod_props->drmFormatModifierTilingFeatures =
-                  optimal_features2;
+               mod_props->drmFormatModifierTilingFeatures = mod_features;
             }
          }
       }
 
-      if (linear_features2) {
-         vk_outarray_append_typed(VkDrmFormatModifierProperties2EXT, &out,
-                                    mod_props)
-         {
-            mod_props->drmFormatModifier = DRM_FORMAT_MOD_LINEAR;
-            mod_props->drmFormatModifierPlaneCount = plane_count;
-            mod_props->drmFormatModifierTilingFeatures = linear_features2;
-         }
-      }
    }
 
    VkSubpassResolvePerformanceQueryEXT *subpass_resolve_perf = vk_find_struct(
@@ -1250,6 +1246,23 @@ get_image_format_properties(struct panvk_physical_device *physical_device,
    VkImageUsageFlags all_usage = info->usage | stencil_usage;
    const struct vk_format_ycbcr_info *ycbcr_info =
       vk_format_get_ycbcr_info(info->format);
+
+   /* Emulated BC formats (panvk_bc_emu.h): 2D and 3D, optimal and linear, as their native
+    * counterparts. Not 1D (no BC format is), and one allocation, no sparse, no host copies, and
+    * nothing that writes the blocks except copies, which the transcoder follows. A linear image
+    * the host writes is refreshed before each submission on the kbase path only. */
+   if (panvk_bc_emu_format(physical_device, info->format) &&
+       (info->type == VK_IMAGE_TYPE_1D ||
+        (info->tiling == VK_IMAGE_TILING_LINEAR &&
+         !pan_kmod_dev_is_kbase(physical_device->kmod.dev)) ||
+        info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT ||
+        (info->flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
+                        VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT | VK_IMAGE_CREATE_DISJOINT_BIT)) ||
+        (all_usage & (VK_IMAGE_USAGE_HOST_TRANSFER_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                      VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT))))
+      goto unsupported;
 
    if (info->flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) {
       if (!physical_device->vk.supported_features.sparseBinding)
@@ -1304,42 +1317,6 @@ get_image_format_properties(struct panvk_physical_device *physical_device,
          goto unsupported;
    }
 
-   switch (info->tiling) {
-   case VK_IMAGE_TILING_LINEAR:
-   case VK_IMAGE_TILING_OPTIMAL:
-      break;
-   case VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT: {
-      const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *mod_info =
-         vk_find_struct_const(
-            info->pNext, PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT);
-
-      /* TODO: switch to using a more generic function for checking mod support here
-       * when adding new modifiers, so that this case doesn't become too big. */
-      const bool can_use_afbc = 
-         PANVK_DEBUG(WSI_AFBC) &&
-         panvk_image_can_use_afbc(physical_device, info->format, info->usage,
-                                  info->type, info->tiling, 0);
-      const bool supported = (drm_is_afbc(mod_info->drmFormatModifier) && can_use_afbc) ||
-         mod_info->drmFormatModifier == DRM_FORMAT_MOD_LINEAR;
-      if (!supported)
-         goto unsupported;
-
-      /* The only difference between optimal and linear is currently whether
-       * depth/stencil attachments are allowed on depth/stencil formats.
-       * There's no reason to allow importing depth/stencil textures, so just
-       * disallow it and then this annoying edge case goes away.
-       */
-      if (util_format_is_depth_or_stencil(format))
-         goto unsupported;
-      break;
-   }
-   default:
-      /* VK_KHR_maintenance5: Physical-device-level functions can now be called
-       * with any value in the valid range for a type beyond the defined
-       * enumerants [...] */
-      goto unsupported;
-   }
-
    /* For the purposes of these checks, we don't care about all the extra
     * YCbCr features and we just want the intersection of features available
     * to all planes of the given format.
@@ -1359,6 +1336,61 @@ get_image_format_properties(struct panvk_physical_device *physical_device,
 
    if (format_feature_flags == 0)
       goto unsupported;
+
+   switch (info->tiling) {
+   case VK_IMAGE_TILING_LINEAR:
+   case VK_IMAGE_TILING_OPTIMAL:
+      break;
+   case VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT: {
+      const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *mod_info =
+         vk_find_struct_const(
+            info->pNext, PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT);
+      if (!mod_info)
+         goto unsupported;
+
+      uint32_t caps = panvk_get_mod_format_caps(
+         physical_device, format, mod_info->drmFormatModifier);
+      if (!(caps & PAN_MOD_FORMAT_CAP_WSI))
+         goto unsupported;
+
+      /* An AFBC modifier can't honor a request for an uncompressed image. */
+      const VkImageCompressionControlEXT *compr_info =
+         vk_find_struct_const(info->pNext, IMAGE_COMPRESSION_CONTROL_EXT);
+      if (compr_info &&
+          (compr_info->flags & VK_IMAGE_COMPRESSION_DISABLED_EXT) &&
+          drm_is_afbc(mod_info->drmFormatModifier))
+         goto unsupported;
+
+      if (info->type == VK_IMAGE_TYPE_1D && !(caps & PAN_MOD_FORMAT_CAP_DIM_1D))
+         goto unsupported;
+      if (info->type == VK_IMAGE_TYPE_2D && !(caps & PAN_MOD_FORMAT_CAP_DIM_2D))
+         goto unsupported;
+      if (info->type == VK_IMAGE_TYPE_3D && !(caps & PAN_MOD_FORMAT_CAP_DIM_3D))
+         goto unsupported;
+
+      /* Depth/stencil formats are not supported for DRM format modifier tiling. */
+      if (util_format_is_depth_or_stencil(format))
+         goto unsupported;
+
+      if (!(caps & PAN_MOD_FORMAT_CAP_DEPTH_STENCIL))
+         format_feature_flags &= ~VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT;
+      if (!(caps & PAN_MOD_FORMAT_CAP_HOST_COPY))
+         format_feature_flags &= ~VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT;
+      if (!(caps & PAN_MOD_FORMAT_CAP_STORAGE_IMAGE)) {
+         format_feature_flags &=
+            ~(VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
+              VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
+              VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT |
+              VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT);
+      }
+      break;
+   }
+   default:
+      /* VK_KHR_maintenance5: Physical-device-level functions can now be called
+       * with any value in the valid range for a type beyond the defined
+       * enumerants [...] */
+      goto unsupported;
+   }
 
    if (ycbcr_info && info->type != VK_IMAGE_TYPE_2D)
       goto unsupported;
@@ -1392,8 +1424,11 @@ get_image_format_properties(struct panvk_physical_device *physical_device,
       goto unsupported;
    }
 
-   if (ycbcr_info)
+   if (ycbcr_info || info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
       maxMipLevels = 1;
+
+   if (info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
+      maxArraySize = 1;
 
    if (info->tiling == VK_IMAGE_TILING_OPTIMAL &&
        info->type == VK_IMAGE_TYPE_2D && ycbcr_info == NULL &&
@@ -1529,6 +1564,37 @@ panvk_get_external_image_format_properties(
    return VK_SUCCESS;
 }
 
+/* Whether an image with this configuration may end up AFBC. The queries have
+ * no image, so a true result is only an upper bound: the usage, create flags
+ * and extent checks happen at image creation.
+ */
+static bool
+panvk_physical_device_can_use_afbc(const struct panvk_physical_device *pdev,
+                                   VkFormat format, VkImageType type,
+                                   VkImageTiling tiling,
+                                   VkImageCompressionFlagsEXT compr_flags)
+{
+   enum pipe_format pfmt = vk_format_to_pipe_format(format);
+
+   /* The application asked for an uncompressed image. */
+   if (compr_flags & VK_IMAGE_COMPRESSION_DISABLED_EXT)
+      return false;
+
+   if (PANVK_DEBUG(NO_AFBC) || tiling == VK_IMAGE_TILING_LINEAR ||
+       type == VK_IMAGE_TYPE_1D || !pan_query_afbc(&pdev->kmod.dev->props))
+      return false;
+
+   PAN_SUPPORTED_MODIFIERS(supported);
+   for (unsigned i = 0; i < ARRAY_SIZE(supported); i++) {
+      if (drm_is_afbc(supported[i]) &&
+          pan_image_test_modifier_with_format(&pdev->kmod.dev->props,
+                                              supported[i], pfmt))
+         return true;
+   }
+
+   return false;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 panvk_GetPhysicalDeviceImageFormatProperties2(
    VkPhysicalDevice physicalDevice,
@@ -1536,13 +1602,15 @@ panvk_GetPhysicalDeviceImageFormatProperties2(
    VkImageFormatProperties2 *base_props)
 {
    VK_FROM_HANDLE(panvk_physical_device, physical_device, physicalDevice);
-   const VkImageStencilUsageCreateInfo *stencil_usage_info = NULL;
    const VkPhysicalDeviceExternalImageFormatInfo *external_info = NULL;
    const VkPhysicalDeviceImageViewImageFormatInfoEXT *image_view_info = NULL;
+   const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *drm_info = NULL;
+   const VkImageCompressionControlEXT *compr_info = NULL;
    VkExternalImageFormatProperties *external_props = NULL;
    VkFilterCubicImageViewImageFormatPropertiesEXT *cubic_props = NULL;
    VkFormatFeatureFlags2 format_feature_flags;
    VkHostImageCopyDevicePerformanceQuery *hic_props = NULL;
+   VkImageCompressionPropertiesEXT *compression_props = NULL;
    VkSamplerYcbcrConversionImageFormatProperties *ycbcr_props = NULL;
    VkResult result;
 
@@ -1553,16 +1621,19 @@ panvk_GetPhysicalDeviceImageFormatProperties2(
       return result;
 
    /* Extract input structs */
-   vk_foreach_struct_const(s, base_info->pNext) {
-      switch (s->sType) {
-      case VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO:
-         stencil_usage_info = (const void*)s;
-         break;
+   vk_foreach_struct_const(sType, s, base_info->pNext) {
+      switch (sType) {
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO:
-         external_info = (const void *)s;
+         external_info = s;
          break;
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_VIEW_IMAGE_FORMAT_INFO_EXT:
-         image_view_info = (const void *)s;
+         image_view_info = s;
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT:
+         drm_info = s;
+         break;
+      case VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_CONTROL_EXT:
+         compr_info = s;
          break;
       default:
          break;
@@ -1570,19 +1641,22 @@ panvk_GetPhysicalDeviceImageFormatProperties2(
    }
 
    /* Extract output structs */
-   vk_foreach_struct(s, base_props->pNext) {
-      switch (s->sType) {
+   vk_foreach_struct(sType, s, base_props->pNext) {
+      switch (sType) {
       case VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES:
-         external_props = (void *)s;
+         external_props = s;
          break;
       case VK_STRUCTURE_TYPE_FILTER_CUBIC_IMAGE_VIEW_IMAGE_FORMAT_PROPERTIES_EXT:
-         cubic_props = (void *)s;
+         cubic_props = s;
          break;
       case VK_STRUCTURE_TYPE_HOST_IMAGE_COPY_DEVICE_PERFORMANCE_QUERY:
-         hic_props = (void *)s;
+         hic_props = s;
+         break;
+      case VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_PROPERTIES_EXT:
+         compression_props = s;
          break;
       case VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_IMAGE_FORMAT_PROPERTIES:
-         ycbcr_props = (void *)s;
+         ycbcr_props = s;
          break;
       default:
          break;
@@ -1637,19 +1711,16 @@ panvk_GetPhysicalDeviceImageFormatProperties2(
       }
    }
 
-   if (hic_props) {
-      VkImageUsageFlags stencil_usage = stencil_usage_info ?
-         stencil_usage_info->stencilUsage : base_info->usage;
+   const VkImageCompressionFlagsEXT compr_flags =
+      compr_info ? compr_info->flags : 0;
 
+   if (hic_props) {
       /* We don't support AFBC for images used for host transfer. So, if an
        * image could have been tiled as AFBC if it weren't for host transfer,
        * report suboptimal access. */
-      VkImageUsageFlags usage = base_info->usage | stencil_usage;
-      usage &= ~VK_IMAGE_USAGE_HOST_TRANSFER_BIT;
-      bool can_use_afbc = panvk_image_can_use_afbc(
-         physical_device, base_info->format, usage, base_info->type,
-         base_info->tiling, base_info->flags);
-      hic_props->optimalDeviceAccess = !can_use_afbc;
+      hic_props->optimalDeviceAccess = !panvk_physical_device_can_use_afbc(
+         physical_device, base_info->format, base_info->type,
+         base_info->tiling, compr_flags);
 
       /* FIXME: we only support host transfer with certain modifiers and for now
        * there's no easy way to know whether the presence of HOST_TRANSFER will
@@ -1660,6 +1731,25 @@ panvk_GetPhysicalDeviceImageFormatProperties2(
        * details.
        */
       hic_props->identicalMemoryLayout = false;
+   }
+
+   if (compression_props) {
+      /* When the application asks about a specific modifier, that modifier
+       * already tells us whether the image is compressed. Otherwise we can
+       * only give the upper bound panvk_physical_device_can_use_afbc()
+       * computes.
+       */
+      bool compressed;
+
+      if (base_info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
+         compressed = drm_info && drm_is_afbc(drm_info->drmFormatModifier);
+      } else {
+         compressed = panvk_physical_device_can_use_afbc(
+            physical_device, base_info->format, base_info->type,
+            base_info->tiling, compr_flags);
+      }
+
+      panvk_image_set_compression_props(compression_props, compressed);
    }
 
    const struct vk_format_ycbcr_info *ycbcr_info =

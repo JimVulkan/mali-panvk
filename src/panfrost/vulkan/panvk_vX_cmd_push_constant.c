@@ -30,6 +30,9 @@ prepare_push_uniforms(struct panvk_cmd_buffer *cmdbuf,
 
    struct panvk_common_sysvals_inner common_inner = {
       .printf_buffer_address = dev->printf.bo->addr.dev,
+#if PAN_ARCH < 9
+      .constant_data = panvk_priv_mem_dev_addr(shader->data_mem),
+#endif
    };
    uint64_t *common = (uint64_t *)&common_inner;
 
@@ -92,7 +95,7 @@ panvk_per_arch(cmd_prepare_compute_push_uniforms)(
                                 (uint64_t *)&cmdbuf->state.compute.sysvals);
 }
 
-#if PAN_ARCH < 9
+#if PAN_ARCH < 10
 VkResult
 panvk_per_arch(cmd_prepare_gs_push_uniforms)(
    struct panvk_cmd_buffer *cmdbuf, const struct panvk_shader_variant *shader,

@@ -1,9 +1,13 @@
 # Third-party notices
 
-This repository is a subset of Mesa 26.3.0-devel with changes by JimVulkan. Every file
+This repository is a subset of Mesa 27.0.0-devel with changes by JimVulkan. Every file
 keeps the license stated in its header, and most are MIT (`LICENSE`); `docs/license.rst`
 is Mesa's own overview. The files below are under other licenses. Full license texts
 are in `LICENSES/`.
+
+`android/gralloc/include` holds Android Open Source Project headers (Apache-2.0) and
+`android/gralloc/abi_override` an LLVM libc++ header (Apache-2.0 WITH LLVM-exception);
+`android/gralloc/NOTICE.md` lists where each comes from.
 
 Meson fetches these at configure time (not in this repository): libdrm 2.4.133 (MIT) and
 zlib 1.3.1 (Zlib), both linked into the driver, and Expat 2.5.0 (MIT), which is not. The
@@ -55,6 +59,7 @@ Text: `LICENSES/Apache-2.0.txt`
 - `include/android_stub/ndk/sync.h`
 - `include/android_stub/sync/sync.h`
 - `include/android_stub/system/graphics.h`
+- `include/android_stub/system/window.h`
 - `include/android_stub/vndk/hardware_buffer.h`
 - `include/android_stub/vndk/window.h`
 - `include/vulkan/vk_android_native_buffer.h`

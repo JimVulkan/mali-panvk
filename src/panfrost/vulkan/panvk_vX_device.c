@@ -10,6 +10,9 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include "drm-uapi/panthor_drm.h"
 
 #include "vk_cmd_enqueue_entrypoints.h"
@@ -42,6 +45,7 @@
 #include "util/u_printf.h"
 #include "pan_props.h"
 #include "pan_samples.h"
+#include "poly/geometry.h"
 #include "pan_buffer.h"
 
 static void *
@@ -108,6 +112,12 @@ panvk_device_init_mempools(struct panvk_device *dev)
    };
 
    panvk_pool_init(&dev->mempools.exec, dev, NULL, NULL, &exec_pool_props);
+
+   struct panvk_pool_properties sync_pool_props = rw_pool_props;
+   sync_pool_props.label = "Device sync object pool";
+   if (pan_kmod_kbase_is_csf(dev->kmod.dev))
+      sync_pool_props.create_flags = PAN_KMOD_BO_FLAG_KBASE_SYNC;
+   panvk_pool_init(&dev->mempools.sync, dev, NULL, NULL, &sync_pool_props);
 }
 
 static void
@@ -115,7 +125,88 @@ panvk_device_cleanup_mempools(struct panvk_device *dev)
 {
    panvk_pool_cleanup(&dev->mempools.rw);
    panvk_pool_cleanup(&dev->mempools.rw_nc);
+   panvk_pool_cleanup(&dev->mempools.sync);
    panvk_pool_cleanup(&dev->mempools.exec);
+}
+
+/* On JM, this is called during device initialization. On CSF, panthor doesn't
+ * support alloc-on-fault, so we initialize the heap the first time it is used
+ * in a command buffer to avoid wasting memory on the heap buffer on
+ * applications that don't use it */
+static VkResult
+panvk_device_init_poly_heap_inner(struct panvk_device *dev)
+{
+#if PAN_ARCH >= 10
+   uint32_t flags = PAN_KMOD_BO_FLAG_NO_MMAP;
+#else
+   uint32_t flags = PAN_KMOD_BO_FLAG_NO_MMAP | PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT;
+#endif
+
+   VkResult result = panvk_priv_bo_create(
+      dev, PANVK_POLY_HEAP_SIZE, flags, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE,
+      &dev->poly_heap.buffer);
+   if (result != VK_SUCCESS) {
+      return result;
+   }
+
+   struct panvk_pool_alloc_info alloc_info = {
+      .size = sizeof(struct poly_heap),
+      .alignment = 8,
+   };
+   dev->poly_heap.state = panvk_pool_alloc_mem(&dev->mempools.rw, alloc_info);
+   if (!panvk_priv_mem_check_alloc(dev->poly_heap.state)) {
+      result = panvk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      panvk_priv_bo_unref(dev->poly_heap.buffer);
+      dev->poly_heap.buffer = NULL;
+      return result;
+   }
+
+   struct poly_heap *state_cpu = panvk_priv_mem_host_addr(dev->poly_heap.state);
+   state_cpu->base = dev->poly_heap.buffer->addr.dev;
+   state_cpu->bottom = 0;
+   state_cpu->size = PANVK_POLY_HEAP_SIZE;
+
+   return VK_SUCCESS;
+}
+
+VkResult
+panvk_per_arch(device_init_poly_heap)(struct panvk_device *dev)
+{
+#if PAN_ARCH >= 10
+   /* On CSF, we only try to initialize poly_heap the first time it is used
+    * during command buffer recording. We can't use util_once_flag for this,
+    * because it has no mechanism to handle failed initialization. So instead
+    * we have to hand-roll something similar with a mutex and an atomic
+    * flag. */
+   if (unlikely(!p_atomic_read(&dev->poly_heap.initialized))) {
+      simple_mtx_lock(&dev->poly_heap.init_lock);
+
+      /* poly_heap was initialized successfully by another thread while we
+       * waited to acquire the lock */
+      if (p_atomic_read(&dev->poly_heap.initialized)) {
+         simple_mtx_unlock(&dev->poly_heap.init_lock);
+         return VK_SUCCESS;
+      }
+
+      VkResult result = panvk_device_init_poly_heap_inner(dev);
+      /* Only set the flag if initialization was successful. If not, we want
+       * to be able to try again */
+      if (result == VK_SUCCESS)
+         p_atomic_set(&dev->poly_heap.initialized, true);
+
+      simple_mtx_unlock(&dev->poly_heap.init_lock);
+
+      return result;
+   }
+   return VK_SUCCESS;
+#else
+   /* On JM, we only expect to call this function once, at device creation, so
+    * there is no need for synchronization */
+   assert(!dev->poly_heap.initialized);
+   VkResult result = panvk_device_init_poly_heap_inner(dev);
+   dev->poly_heap.initialized = true;
+   return result;
+#endif
 }
 
 static VkResult
@@ -330,6 +421,45 @@ panvk_queue_destroy(struct vk_queue *queue)
    }
 }
 
+static void
+init_va_heap(struct panvk_va_heap *heap, uint64_t start, uint64_t end)
+{
+   heap->start = start;
+   heap->end = MAX2(end, start);
+   util_vma_heap_init(&heap->heap, start, heap->end - heap->start);
+}
+
+static void
+init_va_heaps(struct panvk_device *device, uint64_t user_va_start, uint64_t user_va_end)
+{
+   /* capture/replay requires a separate AS for fixed allocations. */
+   init_va_heap(&device->as.heaps[PANVK_FIXED_VA_HEAP],
+                device->vk.enabled_features.bufferDeviceAddressCaptureReplay
+                   ? user_va_end / 2
+                   : user_va_end,
+                user_va_end);
+
+   /* Non-executable heap starts at a 4G offset, and ends where the fixed heap
+    * starts. If the fixed heap stars below the 4G boundary, then this heap
+    * is empty. */
+   init_va_heap(&device->as.heaps[PANVK_NO_EXEC_VA_HEAP], 1ull << 32,
+                device->as.heaps[PANVK_FIXED_VA_HEAP].start);
+
+   /* And Finally, we have the executable heap, which covers at most the
+    * first 4G of the VA space. This is where we'll map all our executable
+    * buffers, but non-executable buffers can also live here if there's no
+    * space in the no-exec heap. */
+   init_va_heap(&device->as.heaps[PANVK_EXEC_VA_HEAP], user_va_start,
+                MIN3(user_va_end, device->as.heaps[PANVK_NO_EXEC_VA_HEAP].start,
+                     device->as.heaps[PANVK_FIXED_VA_HEAP].start));
+}
+
+static void
+cleanup_va_heaps(struct panvk_device *device)
+{
+   for (uint32_t i = 0; i < ARRAY_SIZE(device->as.heaps); i++)
+      util_vma_heap_finish(&device->as.heaps[i].heap);
+}
 #if PAN_ARCH < 9
 /* See panvk_device::null_descs. Built through the device's own entry points, so the texture and
  * attribute descriptors come out exactly as for an application's image and buffer. kbase hands
@@ -520,9 +650,20 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
       .free = panvk_kmod_free,
       .priv = &device->vk.alloc,
    };
-   device->kmod.dev = pan_kmod_dev_create(
-      os_dupfd_cloexec(physical_device->kmod.dev->fd),
-      physical_device->kmod.dev->flags, &device->kmod.allocator);
+   /* On kbase a context belongs to the open file, not to the fd: a dup shares it, with its atom
+    * numbers and its one event queue. Each logical device reads completions from its own thread,
+    * so two devices on one context took each other's events and dropped them, and the second
+    * device's fences never signalled (probe/mali/vkdev2.c; a test app that keeps its D3D11
+    * device while it runs the D3D9 test). So each logical device opens its own context. */
+   const int dev_fd = pan_kmod_dev_is_kbase(physical_device->kmod.dev)
+                         ? open(PANVK_KBASE_PATH, O_RDWR | O_CLOEXEC)
+                         : os_dupfd_cloexec(physical_device->kmod.dev->fd);
+   device->kmod.dev =
+      dev_fd < 0 ? NULL
+                 : pan_kmod_dev_create(dev_fd, physical_device->kmod.dev->flags,
+                                       &device->kmod.allocator);
+   if (!device->kmod.dev && dev_fd >= 0)
+      close(dev_fd);
 
    if (!device->kmod.dev) {
       result = panvk_errorf(instance, VK_ERROR_OUT_OF_HOST_MEMORY,
@@ -540,7 +681,10 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
    uint64_t user_va_start = pan_clamp_to_usable_va_range(
       device->kmod.dev, PANVK_VA_RESERVE_BOTTOM);
    uint64_t user_va_end = physical_device->memory.max_supported_va;
-   uint32_t vm_flags = PAN_ARCH < 10 ? PAN_KMOD_VM_FLAG_AUTO_VA : 0;
+   /* kbase assigns every VA itself, CSF parts included. */
+   uint32_t vm_flags = PAN_ARCH < 10 || pan_kmod_dev_is_kbase(device->kmod.dev)
+                          ? PAN_KMOD_VM_FLAG_AUTO_VA
+                          : 0;
 
    device->kmod.vm =
       pan_kmod_vm_create(device->kmod.dev, vm_flags,
@@ -550,6 +694,8 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
       result = panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
       goto err_destroy_kdev;
    }
+
+   init_va_heaps(device, user_va_start, user_va_end);
 
 #if PAN_ARCH >= 10
    const struct drm_panthor_csif_info *csif_info =
@@ -574,36 +720,6 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
    simple_mtx_init(&device->as.lock, mtx_plain);
    simple_mtx_init(&device->polygon_gs.lock, mtx_plain);
 
-   /* capture/replay requires a separate AS for fixed allocations. */
-   if (device->vk.enabled_features.bufferDeviceAddressCaptureReplay) {
-      const uint64_t split_point = user_va_end / 2;
-      util_vma_heap_init(&device->as.fixed_heap, split_point,
-                           user_va_end - split_point);
-      device->as.split_heap = true;
-      /* shift the start of the non-fixed heap below the fixed one */
-      user_va_end = split_point;
-   }
-
-   const uint64_t low_va_end = 1ull << 32;
-   if (user_va_end <= low_va_end) {
-      /* if user_va_end overlaps with the low 32bits, share the AS for both. */
-      util_vma_heap_init(&device->as.heap, user_va_start,
-                         user_va_end - user_va_start);
-      device->as.priv_heap = &device->as.heap;
-      device->as.extended_range = false;
-   } else {
-      util_vma_heap_init(&device->as.heap, low_va_end,
-                         user_va_end - low_va_end);
-      device->as.priv_heap = malloc(sizeof(*device->as.priv_heap));
-      if (device->as.priv_heap == NULL) {
-         result = panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
-         goto err_free_heaps;
-      }
-      util_vma_heap_init(device->as.priv_heap, user_va_start,
-                         low_va_end - user_va_start);
-      device->as.extended_range = true;
-   }
-
    panvk_device_init_mempools(device);
 
 #if PAN_ARCH >= 10
@@ -623,14 +739,6 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
       device, 128 * 1024 * 1024,
       PAN_KMOD_BO_FLAG_NO_MMAP | PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT,
       VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, &device->tiler_heap);
-   if (result != VK_SUCCESS)
-      goto err_free_priv_bos;
-
-   result = panvk_priv_bo_create(
-      device,
-      PANVK_JM_MAX_VERTICES_INDIRECT * PANVK_JM_MAX_PER_VTX_ATTRIBUTES_INDIRECT_SIZE,
-      PAN_KMOD_BO_FLAG_NO_MMAP | PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT,
-      VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, &device->indirect_varying_buffer);
    if (result != VK_SUCCESS)
       goto err_free_priv_bos;
 #endif
@@ -656,6 +764,14 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
                        pan_sample_positions_buffer_size());
 
 #if PAN_ARCH >= 10
+   simple_mtx_init(&device->poly_heap.init_lock, mtx_plain);
+#else
+   result = panvk_per_arch(device_init_poly_heap)(device);
+   if (result != VK_SUCCESS)
+      goto err_free_priv_bos;
+#endif
+
+#if PAN_ARCH >= 10
    result = panvk_per_arch(init_tiler_oom)(device);
    if (result != VK_SUCCESS)
       goto err_free_priv_bos;
@@ -671,11 +787,7 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
                  device->printf.bo->addr.host);
 
    device->drm_fd = device->kmod.dev->fd;
-   if (pan_kmod_dev_is_kbase(device->kmod.dev))
-      device->vk.sync = pan_kmod_kbase_sync_provider();
-   else
-      vk_device_set_drm_fd(&device->vk, device->kmod.dev->fd);
-
+   device->vk.sync =  pan_kmod_sync_clone(device->kmod.dev);
 
    result = panvk_precomp_init(device);
    if (result != VK_SUCCESS)
@@ -699,6 +811,7 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
    result = panvk_meta_init(device);
    if (result != VK_SUCCESS)
       goto err_free_draw_ctx;
+   panvk_bc_emu_device_init(device);
 
 #if PAN_ARCH < 9
    /* Always, not only with nullDescriptor: a few KB, and an application that binds null without
@@ -743,6 +856,7 @@ err_finish_queues:
    vk_foreach_queue_safe(queue, &device->vk)
       panvk_queue_destroy(queue);
 
+   panvk_bc_emu_device_finish(device);
    panvk_meta_cleanup(device);
 
 err_free_draw_ctx:
@@ -759,21 +873,17 @@ err_free_priv_bos:
    panvk_priv_bo_unref(device->printf.bo);
    panvk_priv_bo_unref(device->tiler_oom.handlers_bo);
    panvk_priv_bo_unref(device->sample_positions);
-   panvk_priv_bo_unref(device->indirect_varying_buffer);
+   panvk_pool_free_mem(&device->poly_heap.state);
+   panvk_priv_bo_unref(device->poly_heap.buffer);
+#if PAN_ARCH >= 10
+   simple_mtx_destroy(&device->poly_heap.init_lock);
+#endif
    panvk_priv_bo_unref(device->tess_heap);
    panvk_priv_bo_unref(device->tiler_heap);
    panvk_device_cleanup_mempools(device);
    vk_free(&device->vk.alloc, device->dump_region_size);
-err_free_heaps:
    pan_kmod_vm_destroy(device->kmod.vm);
-   util_vma_heap_finish(&device->as.heap);
-   if (device->as.extended_range) {
-      util_vma_heap_finish(device->as.priv_heap);
-      free(device->as.priv_heap);
-      device->as.priv_heap = NULL;
-   }
-   if (device->as.split_heap)
-      util_vma_heap_finish(&device->as.fixed_heap);
+   cleanup_va_heaps(device);
    simple_mtx_destroy(&device->as.lock);
    simple_mtx_destroy(&device->polygon_gs.lock);
 
@@ -817,27 +927,25 @@ panvk_per_arch(destroy_device)(struct panvk_device *device,
 #if PAN_ARCH >= 10 && PAN_ARCH < 14
    panvk_per_arch(device_draw_context_cleanup)(device);
 #endif
+   panvk_bc_emu_device_finish(device);
    panvk_meta_cleanup(device);
    vk_pipeline_cache_destroy(device->vk.mem_cache, NULL);
    pan_kmod_bo_put(device->sparse_mem.blackhole);
    u_printf_destroy(&device->printf.ctx);
    panvk_priv_bo_unref(device->printf.bo);
    panvk_priv_bo_unref(device->tiler_oom.handlers_bo);
-   panvk_priv_bo_unref(device->indirect_varying_buffer);
+   panvk_pool_free_mem(&device->poly_heap.state);
+   panvk_priv_bo_unref(device->poly_heap.buffer);
+#if PAN_ARCH >= 10
+   simple_mtx_destroy(&device->poly_heap.init_lock);
+#endif
    panvk_priv_bo_unref(device->tess_heap);
    panvk_priv_bo_unref(device->tiler_heap);
    panvk_priv_bo_unref(device->sample_positions);
    panvk_device_cleanup_mempools(device);
    vk_free(&device->vk.alloc, device->dump_region_size);
    pan_kmod_vm_destroy(device->kmod.vm);
-   util_vma_heap_finish(&device->as.heap);
-   if (device->as.extended_range && (device->as.priv_heap != NULL)) {
-      util_vma_heap_finish(device->as.priv_heap);
-      free(device->as.priv_heap);
-      device->as.priv_heap = NULL;
-   }
-   if (device->as.split_heap)
-      util_vma_heap_finish(&device->as.fixed_heap);
+   cleanup_va_heaps(device);
    simple_mtx_destroy(&device->as.lock);
 
    if (device->debug.decode_ctx)

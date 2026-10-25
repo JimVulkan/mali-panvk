@@ -1,12 +1,12 @@
-PanVK for Mali Bifrost on kbase -- third-party notices
-=====================================================
+PanVK for Mali on kbase -- third-party notices
+==============================================
 
 libvulkan_panfrost.so is built from mali-panvk, a subset of the Mesa 3D Graphics Library
-26.3.0-devel with changes by JimVulkan. The components below are compiled into it. Each is
+27.0.0-devel with changes by JimVulkan. The components below are compiled into it. Each is
 followed by its copyright holders; the license texts are at the end of this file.
 
-Mesa 3D Graphics Library (PanVK, the Bifrost compiler, libpan, NIR, the Vulkan runtime and
-utilities)
+Mesa 3D Graphics Library (PanVK, the Bifrost and Valhall compiler, libpan, NIR, the Vulkan
+runtime and utilities)
    Copyright the Mesa authors, as listed in each source file
    Copyright 2026 JimVulkan (the kbase port and the Mali changes)
    License: MIT
@@ -45,6 +45,16 @@ C11 threads and time emulation (src/c11)
    (C) Copyright yohhoy 2012.
    Copyright 2022 Yonggang Luo
    License: BSL-1.0
+
+Android Open Source Project headers (libutils, libhidl, libfmq, libbinder_ndk, libgralloctypes,
+and headers generated from the graphics HAL interfaces), whose inline code the IMapper 4.0
+gralloc backend compiles in
+   Copyright The Android Open Source Project
+   License: Apache-2.0
+
+LLVM libc++ and libc++abi, from the Android NDK (linked statically)
+   Copyright the LLVM Project contributors
+   License: Apache-2.0 WITH LLVM-exception
 
 ----------------------------------------------------------------------------------------------------
 MIT
@@ -361,3 +371,19 @@ subsequently incorporated within the Work.
    liability.
 
 END OF TERMS AND CONDITIONS
+
+---- LLVM Exceptions to the Apache 2.0 License ----
+
+As an exception, if, as a result of your compiling your source code, portions
+of this Software are embedded into an Object form of such source code, you
+may redistribute such embedded portions in such Object form without complying
+with the conditions of Sections 4(a), 4(b) and 4(d) of the License.
+
+In addition, if you combine or link compiled forms of this Software with
+software that is licensed under the GPLv2 ("Combined Software") and if a
+court of competent jurisdiction determines that the patent provision (Section
+3), the indemnity provision (Section 9) or other Section of the License
+conflicts with the conditions of the GPLv2, you may retroactively and
+prospectively choose to deem waived or otherwise exclude such Section(s) of
+the License, but only in their entirety and only with respect to the Combined
+Software.

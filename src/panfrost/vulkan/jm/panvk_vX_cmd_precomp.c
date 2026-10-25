@@ -55,6 +55,20 @@ panvk_per_arch(dispatch_precomp)(struct panvk_precomp_ctx *ctx,
    struct pan_ptr job = panvk_cmd_alloc_desc(cmdbuf, COMPUTE_JOB);
    assert(job.gpu);
 
+   struct pan_compute_dim dim = {.x = grid.count[0],
+                                 .y = grid.count[1],
+                                 .z = grid.count[2]};
+   uint64_t tld =
+      panvk_per_arch(cmd_dispatch_prepare_tls)(cmdbuf, shader, &dim, false);
+   assert(tld);
+
+#if PAN_ARCH >= 9
+   /* Precompiled kernels take no descriptors, only push uniforms. */
+   panvk_per_arch(jm_pack_compute_payload)(job.cpu, shader, grid.count[0],
+                                           grid.count[1], grid.count[2], 0,
+                                           push_uniforms.gpu, tld,
+      DIV_ROUND_UP(BIFROST_PRECOMPILED_KERNEL_SYSVALS_SIZE + data_size, 8));
+#else
    pan_pack_work_groups_compute(
       pan_section_ptr(job.cpu, COMPUTE_JOB, INVOCATION), grid.count[0],
       grid.count[1], grid.count[2], shader->cs.local_size.x,
@@ -66,18 +80,13 @@ panvk_per_arch(dispatch_precomp)(struct panvk_precomp_ctx *ctx,
                            util_logbase2_ceil(shader->cs.local_size.z + 1);
    }
 
-   struct pan_compute_dim dim = {.x = grid.count[0],
-                                 .y = grid.count[1],
-                                 .z = grid.count[2]};
-   uint64_t tld =
-      panvk_per_arch(cmd_dispatch_prepare_tls)(cmdbuf, shader, &dim, false);
-   assert(tld);
-
    pan_section_pack(job.cpu, COMPUTE_JOB, DRAW, cfg) {
       cfg.state = panvk_priv_mem_dev_addr(shader->rsd),
       cfg.push_uniforms = push_uniforms.gpu;
       cfg.thread_storage = tld;
    }
+#endif
+
 
    util_dynarray_append(&batch->jobs, job.cpu);
 
@@ -85,6 +94,10 @@ panvk_per_arch(dispatch_precomp)(struct panvk_precomp_ctx *ctx,
    bool suppress_prefetch =
       (barrier & PANLIB_BARRIER_JM_SUPPRESS_PREFETCH) != 0;
 
+#if PAN_ARCH < 9
+   if (cmdbuf->cur_batch == batch)
+      panvk_per_arch(cmd_flush_pending_tilers)(cmdbuf, 0);
+#endif
    pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_COMPUTE, job_barrier,
                   suppress_prefetch, grid.jm.local_dep, grid.jm.global_dep,
                   &job, false);

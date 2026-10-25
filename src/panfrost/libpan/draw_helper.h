@@ -26,12 +26,6 @@ struct libpan_draw_helper_index_min_max_result {
     uint32_t max;
 };
 
-struct libpan_draw_helper_varying_buf_info {
-    uint64_t address;
-    uint32_t size;
-    atomic_uint offset;
-};
-
 struct libpan_draw_helper_attrib_buf_info {
     uint32_t divisor;
     uint32_t stride;
@@ -53,7 +47,7 @@ struct libpan_draw_batch_entry {
     uint64_t index_buffer_ptr;
     uint64_t index_min_out;        /* uint32_t: the index minimum, for the GS emulation */
     uint64_t varying_bufs_descs;
-    uint64_t varying_bufs_info;
+    uint64_t heap;                 /* struct poly_heap: the varyings of every draw */
     uint64_t attrib_bufs_descs;
     uint64_t attrib_bufs_infos;
     uint64_t attribs_descs;
@@ -80,6 +74,9 @@ struct libpan_draw_batch {
     uint32_t pad;
 };
 
+#endif
+
+#if PAN_ARCH >= 6 && PAN_ARCH <= 9
 /* Transform feedback captured from the geometry shader emulation, one per capturing draw. The draw
  * path fills everything above `start`; panlib_xfb_scan fills the rest, panlib_xfb_copy reads it. */
 struct libpan_xfb_draw {
@@ -100,5 +97,20 @@ struct libpan_xfb_draw {
     uint32_t start[4];       /* scan: byte offset this draw writes each buffer from */
     uint32_t written;        /* scan: primitives captured */
     uint32_t needed;         /* scan: primitives emitted */
+};
+#endif
+
+#if PAN_ARCH == 9
+/* One indirect draw on v9, patched into its MALLOC_VERTEX job by panlib_v9_draw_indirect. */
+struct libpan_v9_indirect_draw {
+   uint64_t cmd;                  /* VkDraw[Indexed]IndirectCommand */
+   uint64_t job;                  /* the MALLOC_VERTEX job */
+   uint64_t index_buffer;         /* 0 for a non-indexed draw */
+   uint64_t first_vertex_sysval;  /* 0 if the shader does not read it */
+   uint64_t base_instance_sysval; /* 0 if the shader does not read it */
+   uint64_t attribs;              /* the vertex shader's ATTRIBUTE descriptors */
+   uint32_t index_size;
+   uint32_t patch_attribs;        /* per-instance attributes offset by firstInstance * stride */
+   uint32_t strides[16];
 };
 #endif

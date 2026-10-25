@@ -48,6 +48,7 @@ struct panvk_attrib_buf {
 
 struct panvk_resolve_attachment {
    VkResolveModeFlagBits mode;
+   VkRenderingAttachmentFlagsKHR flags;
    struct panvk_image_view *dst_iview;
 };
 
@@ -93,8 +94,9 @@ struct panvk_rendering_state {
       /* nr_samples to be used before framebuffer / tiler descriptor are emitted */
       uint32_t nr_samples;
 
-#if PAN_ARCH < 9
+#if PAN_ARCH < 10
       uint32_t bo_count;
+
       struct pan_kmod_bo *bos[(MAX_RTS * PANVK_MAX_PLANES) + 2];
       bool needs_load;
       bool needs_store;
@@ -183,7 +185,7 @@ struct panvk_cmd_graphics_state {
       bool restart;
    } idvs;
 
-#if PAN_ARCH < 9
+#if PAN_ARCH < 10
    /* Geometry shaders are emulated by a compute job between the vertex and tiler jobs; see
     * panvk_nir_lower_gs.c. The buffers are the ones that job writes and the tiler then reads. */
    struct {
@@ -261,8 +263,6 @@ struct panvk_cmd_graphics_state {
       uint64_t attrib_bufs;
       uint64_t indirect_attribs_infos;
       uint64_t indirect_attrib_bufs_infos;
-      uint64_t indirect_varying_bufs_infos;
-      bool previous_draw_was_indirect;
 #else
       /* The number of times desc is repeated.  Zero means that it is not
        * repeated but also that it's re-usable across draws and we're not

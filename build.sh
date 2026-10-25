@@ -5,12 +5,14 @@
 #   The NDK can also come from ANDROID_NDK_HOME or ANDROID_NDK_ROOT. Linux only (WSL works): the
 #   first stage builds host tools that need LLVM.
 #   BUILD_DIR overrides the Android build directory (default: build-android).
+#   GRALLOC=0 builds without the IMapper 4.0 gralloc backend (see README.md, Gralloc).
 #
 # Two stages:
 #   1. build-host: mesa_clc, vtn_bindgen2 and panfrost_compile, native, from this tree. They
 #      compile the driver's OpenCL helper kernels (libpan, poly) at build time, so they have to be
 #      built from the same compiler sources as the driver.
-#   2. build-android: libvulkan_panfrost.so, cross-compiled with the NDK, using those tools.
+#   2. build-android: libvulkan_panfrost.so, cross-compiled with the NDK, using those tools,
+#      after generating the link stubs for the gralloc backend (android/gralloc/mkstubs.py).
 #
 # Requires: meson, ninja, python3 (mako, packaging, pyyaml), pkg-config, glslangValidator, and for
 # stage 1 LLVM with clang, libclc and the SPIR-V LLVM translator of one major version (Ubuntu:
@@ -67,6 +69,16 @@ export PATH
 BUILD="${BUILD_DIR:-build-android}"
 mkdir -p "$BUILD" "$BUILD/pkgconfig-empty"
 
+GRALLOC_DEPS=
+if [ "${GRALLOC:-1}" != 0 ]; then
+   # Headers from android/gralloc, stand-in libraries generated here: nothing from a device.
+   GRALLOC_DEPS="$PWD/$BUILD/gralloc"
+   rm -rf "$GRALLOC_DEPS"
+   mkdir -p "$GRALLOC_DEPS"
+   cp -r android/gralloc/include android/gralloc/abi_override "$GRALLOC_DEPS/"
+   python3 android/gralloc/mkstubs.py "$BIN/aarch64-linux-android31-clang" "$GRALLOC_DEPS/libs-a12"
+fi
+
 cat > "$BUILD/cross.ini" <<EOF
 [binaries]
 c = '$BIN/aarch64-linux-android31-clang'
@@ -92,12 +104,16 @@ if [ ! -f "$BUILD/build.ninja" ]; then
       -Dbuildtype=debugoptimized -Db_ndebug=true \
       -Dplatforms=android -Dplatform-sdk-version=31 -Dandroid-stub=true -Dandroid-strict=false \
       -Dandroid-libbacktrace=disabled \
-      -Dvulkan-drivers=panfrost -Dgallium-drivers= -Dtools= -Dvideo-codecs= \
+      -Dvulkan-drivers=panfrost -Dgallium-drivers= -Dvulkan-layers= -Dtools= -Dvideo-codecs= \
+      -Dxclipse-gralloc-deps="$GRALLOC_DEPS" \
       -Dmesa-clc=system -Dprecomp-compiler=system \
       -Dllvm=disabled -Dzstd=disabled -Dlmsensors=disabled -Dperfetto=false \
       -Dglx=disabled -Dgbm=disabled -Degl=disabled -Dgles1=disabled -Dgles2=disabled \
       -Dallow-fallback-for=libdrm,perfetto --force-fallback-for=expat,libdrm,zlib \
       -Dlibdrm:default_library=static -Dexpat:default_library=static -Dzlib:default_library=static
+else
+   # An existing build directory follows GRALLOC too.
+   meson configure "$BUILD" -Dxclipse-gralloc-deps="$GRALLOC_DEPS"
 fi
 
 ninja -C "$BUILD" src/panfrost/vulkan/libvulkan_panfrost.so

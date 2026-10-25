@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "kmod/kbase_kmod.h"
 #include "panvk_cmd_buffer.h"
 #include "panvk_device.h"
 #include "panvk_entrypoints.h"
@@ -28,7 +29,9 @@ panvk_per_arch(CreateEvent)(VkDevice _device,
       .alignment = 64,
    };
 
-   event->syncobjs = panvk_pool_alloc_mem(&device->mempools.rw_nc, info);
+   event->syncobjs = panvk_pool_alloc_mem(
+      pan_kmod_kbase_is_csf(device->kmod.dev) ? &device->mempools.sync : &device->mempools.rw_nc,
+      info);
    if (!panvk_priv_mem_check_alloc(event->syncobjs)) {
       vk_object_free(&device->vk, pAllocator, event);
       return panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);

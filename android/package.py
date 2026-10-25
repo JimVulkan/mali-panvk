@@ -58,7 +58,8 @@ def main():
     header = open(os.path.join(ROOT, 'include', 'vulkan', 'vulkan_core.h')).read()
     api = re.search(r'VK_HEADER_VERSION_COMPLETE VK_MAKE_API_VERSION\(0, (\d+), (\d+), VK_HEADER_VERSION\)', header)
     patch = re.search(r'#define VK_HEADER_VERSION (\d+)', header)
-    # The headers say 1.4; PanVK reports 1.3 on Bifrost (v6/v7), which is what this package is for.
+    # The headers say 1.4; PanVK reports 1.3 on Bifrost and Valhall v9, 1.4 from v10 on. The
+    # package states what every supported GPU gets.
     vulkan = 'Vulkan 1.3.%s' % patch.group(1)
 
     commit = git('rev-parse', '--short', 'HEAD')
@@ -67,9 +68,9 @@ def main():
 
     meta = {
         'schemaVersion': 1,
-        'name': 'PanVK Mali Bifrost (kbase) (Mesa %s%s)' % (mesa_version, suffix),
-        'description': 'PanVK for Mali Bifrost GPUs on the stock Arm kbase kernel driver, based on '
-                       'Mesa %s.' % mesa_version,
+        'name': 'PanVK Mali Bifrost/Valhall (kbase) (Mesa %s%s)' % (mesa_version, suffix),
+        'description': 'PanVK for Mali Bifrost and Valhall GPUs on the stock Arm kbase kernel '
+                       'driver, based on Mesa %s.' % mesa_version,
         'author': 'JimVulkan',
         'packageVersion': count,
         'vendor': 'Mesa',

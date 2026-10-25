@@ -60,6 +60,71 @@ panvk_per_arch(cmd_dispatch_prepare_tls)(
    return batch->tls.gpu;
 }
 
+#if PAN_ARCH >= 9
+/* The driver set of a Valhall compute shader: the dummy sampler, then the dynamic buffers. As
+ * on CSF (csf/panvk_vX_cmd_dispatch.c). */
+static VkResult
+prepare_driver_set(struct panvk_cmd_buffer *cmdbuf)
+{
+   if (!compute_state_dirty(cmdbuf, CS) &&
+       !compute_state_dirty(cmdbuf, DESC_STATE))
+      return VK_SUCCESS;
+
+   const struct panvk_shader_desc_info *cs_desc_info =
+      &cmdbuf->state.compute.shader->desc_info;
+   const struct panvk_descriptor_state *desc_state =
+      &cmdbuf->state.compute.desc_state;
+   struct panvk_shader_desc_state *cs_desc_state =
+      &cmdbuf->state.compute.cs.desc;
+   uint32_t desc_count = cs_desc_info->dyn_bufs.count + 1;
+   struct pan_ptr driver_set = panvk_cmd_alloc_dev_mem(
+      cmdbuf, desc, desc_count * PANVK_DESCRIPTOR_SIZE, PANVK_DESCRIPTOR_SIZE);
+   struct panvk_opaque_desc *descs = driver_set.cpu;
+
+   if (!driver_set.gpu)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+   pan_cast_and_pack(&descs[0], SAMPLER, cfg) {
+      cfg.clamp_integer_array_indices = false;
+   }
+
+   panvk_per_arch(cmd_fill_dyn_bufs)(desc_state, cs_desc_info,
+                                     (struct mali_buffer_packed *)(&descs[1]));
+
+   cs_desc_state->driver_set.dev_addr = driver_set.gpu;
+   cs_desc_state->driver_set.size = desc_count * PANVK_DESCRIPTOR_SIZE;
+   compute_state_set_dirty(cmdbuf, DESC_STATE);
+   return VK_SUCCESS;
+}
+
+/* A Valhall compute job's payload: workgroup size and count, and the shader environment. */
+void
+panvk_per_arch(jm_pack_compute_payload)(void *job,
+                                        const struct panvk_shader_variant *cs,
+                                        uint32_t wg_x, uint32_t wg_y,
+                                        uint32_t wg_z, uint64_t res_table,
+                                        uint64_t fau, uint64_t tsd,
+                                        uint32_t fau_count)
+{
+   pan_section_pack(job, COMPUTE_JOB, PAYLOAD, cfg) {
+      cfg.workgroup_size_x = cs->cs.local_size.x;
+      cfg.workgroup_size_y = cs->cs.local_size.y;
+      cfg.workgroup_size_z = cs->cs.local_size.z;
+      cfg.workgroup_count_x = wg_x;
+      cfg.workgroup_count_y = wg_y;
+      cfg.workgroup_count_z = wg_z;
+      cfg.allow_merging_workgroups = cs->info.cs.allow_merging_workgroups;
+      cfg.task_increment = 1;
+      cfg.task_axis = MALI_TASK_AXIS_Z;
+      cfg.compute.resources = res_table;
+      cfg.compute.shader = panvk_priv_mem_dev_addr(cs->spd);
+      cfg.compute.thread_storage = tsd;
+      cfg.compute.fau = fau;
+      cfg.compute.fau_count = fau_count;
+   }
+}
+#endif
+
 static void
 cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
 {
@@ -68,8 +133,13 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
    VkResult result;
 
    /* If there's no compute shader, we can skip the dispatch. */
+#if PAN_ARCH >= 9
+   if (!panvk_priv_mem_check_alloc(cs->spd))
+      return;
+#else
    if (!panvk_priv_mem_check_alloc(cs->rsd))
       return;
+#endif
 
    panvk_per_arch(cmd_close_batch)(cmdbuf);
    struct panvk_batch *batch = panvk_per_arch(cmd_open_batch)(cmdbuf);
@@ -97,6 +167,21 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
 
    struct pan_ptr copy_desc_job = {0};
 
+#if PAN_ARCH >= 9
+   panvk_per_arch(cmd_prepare_dispatch_sysvals)(cmdbuf, info);
+
+   result = prepare_driver_set(cmdbuf);
+   if (result != VK_SUCCESS)
+      return;
+
+   if (compute_state_dirty(cmdbuf, CS) ||
+       compute_state_dirty(cmdbuf, DESC_STATE)) {
+      result = panvk_per_arch(cmd_prepare_shader_res_table)(
+         cmdbuf, desc_state, cs_desc_info, cs_desc_state, 1);
+      if (result != VK_SUCCESS)
+         return;
+   }
+#else
    if (compute_state_dirty(cmdbuf, CS) ||
        compute_state_dirty(cmdbuf, DESC_STATE)) {
       result = panvk_per_arch(cmd_prepare_shader_desc_tables)(
@@ -120,6 +205,7 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
    }
 
    panvk_per_arch(cmd_prepare_dispatch_sysvals)(cmdbuf, info);
+#endif
 
    struct pan_ptr push_uniforms;
    result = panvk_per_arch(cmd_prepare_compute_push_uniforms)(
@@ -134,6 +220,13 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
 
    util_dynarray_append(&batch->jobs, job.cpu);
 
+#if PAN_ARCH >= 9
+   /* Indirect: the counts are patched in by panlib_indirect_dispatch. */
+   panvk_per_arch(jm_pack_compute_payload)(
+      job.cpu, cs, indirect ? 1 : wg_count.x, indirect ? 1 : wg_count.y,
+      indirect ? 1 : wg_count.z, cs_desc_state->res_table,
+      cmdbuf->state.compute.push_uniforms, tsd, cs->fau.total_count);
+#else
    if (!indirect) {
       pan_pack_work_groups_compute(
          pan_section_ptr(job.cpu, COMPUTE_JOB, INVOCATION), wg_count.x,
@@ -158,8 +251,10 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
       cfg.textures = cs_desc_state->tables[PANVK_BIFROST_DESC_TABLE_TEXTURE];
       cfg.samplers = cs_desc_state->tables[PANVK_BIFROST_DESC_TABLE_SAMPLER];
    }
+#endif
 
    unsigned indirect_dep = 0;
+
    if (indirect) {
       /* We redirect write to memory sink for null pointers */
       uint64_t num_work_groups_x_sysval_addr = 0x8ull << 60;

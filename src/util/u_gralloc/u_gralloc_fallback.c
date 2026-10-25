@@ -15,6 +15,7 @@
 
 #include "util/macros.h"
 #include "util/u_memory.h"
+#include "util/u_xclipse_log.h"
 
 #include <dlfcn.h>
 #include <errno.h>
@@ -44,6 +45,27 @@ get_native_buffer_fds(const native_handle_t *handle, int fds[3])
    return handle->numFds;
 }
 
+/* The fd of a handle that holds the buffer: the largest dma-buf among its fds. Allocators do not
+ * agree on where it is: MediaTek's ARM gralloc puts -1 first and the buffer second, and a small
+ * shared-attribute region may follow it. Returns -1 when no fd has a size. */
+static int
+largest_handle_fd(const native_handle_t *handle)
+{
+   int fd = -1;
+   off_t best = 0;
+   for (int i = 0; i < handle->numFds; i++) {
+      if (handle->data[i] < 0)
+         continue;
+      const off_t sz = lseek(handle->data[i], 0, SEEK_END);
+      lseek(handle->data[i], 0, SEEK_SET);
+      if (sz > best) {
+         best = sz;
+         fd = handle->data[i];
+      }
+   }
+   return fd;
+}
+
 #ifdef HAS_SAMSUNG_GRALLOC
 /* Samsung Exynos gralloc private handle (Xclipse devices), measured on SM-S908B. Indices are into
  * native_handle_t::data[]: the struct has a fixed fd array, so numFds does not shift them. 64-bit fields are stored as low/high int pairs.
@@ -54,6 +76,7 @@ get_native_buffer_fds(const native_handle_t *handle, int fds[3])
 #define SEC_HND_HEIGHT       31
 #define SEC_HND_STRIDE       35 /* pixels */
 #define SEC_HND_ALLOC_FORMAT 37 /* HAL format actually allocated */
+#define SEC_HND_LAYOUT       38 /* 1 linear, 2 compressed tiling (probe/gfx/grhandle, ahbx) */
 #define SEC_HND_NUM_PLANES   39
 #define SEC_HND_PLANE0       41 /* per plane: size, offset, byte stride, alloc width, alloc height */
 #define SEC_HND_PLANE_INTS   10
@@ -78,6 +101,21 @@ samsung_gralloc_get_buffer_info(struct u_gralloc_buffer_handle *hnd,
 
    const int format = handle->data[SEC_HND_ALLOC_FORMAT];
    const int num_planes = handle->data[SEC_HND_NUM_PLANES];
+
+   /* data[38] is the layout: 1 linear, 2 the vendor's compressed tiling (GPU-only usage on the 530
+    * and 940, composer buffers everywhere). Nothing here can describe the latter, so it is still
+    * imported as linear, and its contents will not match the vendor's: say so, once, with
+    * debug.radv_xclipse_log >= 1. */
+   if (handle->data[SEC_HND_LAYOUT] != 1) {
+      static bool warned;
+      if (!warned) {
+         warned = true;
+         if (u_xclipse_log_on())
+            mesa_logw("Samsung gralloc: buffer %dx%d with non-linear layout %d imported as linear; "
+                      "contents will not match other users of it",
+                      handle->data[SEC_HND_WIDTH], handle->data[SEC_HND_HEIGHT], handle->data[SEC_HND_LAYOUT]);
+      }
+   }
    if (num_planes != 1 || is_hal_format_yuv(format)) {
       mesa_loge("Samsung gralloc: unsupported format 0x%x (%d planes)", format, num_planes);
       return -EINVAL;
@@ -259,9 +297,36 @@ arm_gralloc_get_buffer_info(struct u_gralloc_buffer_handle *hnd,
          plane0 = o;
    }
    if (plane0 < 0) {
-      mesa_loge("ARM gralloc: no plane layout matches the handle (%ux%u, format 0x%x)", width,
-                height, format);
-      return -EINVAL;
+      /* An ARM handle of a layout not measured here (another allocator version: a Helio G90's
+       * Mali-G76 did not match either). Refusing it made every AHardwareBuffer import fail, and
+       * with it the swapchain of every Winlator-style wrapper. Take the buffer as linear, with
+       * the stride the allocator reported to the app, and log the handle once so its layout can
+       * be added. ARM's allocator only compresses GPU-only buffers, and the wrappers' and the
+       * swapchain's buffers carry CPU or composer usage, so they are linear. */
+      static bool dumped;
+      if (!dumped) {
+         dumped = true;
+         char ints[512] = "";
+         for (int i = handle->numFds; i < total && strlen(ints) < sizeof(ints) - 12; i++)
+            snprintf(ints + strlen(ints), sizeof(ints) - strlen(ints), " %x",
+                     (unsigned)handle->data[i]);
+         mesa_logw("ARM gralloc: unknown handle layout (%d fds, %d ints, magic at %d, request "
+                   "format 0x%x stride %d); taken as linear. ints:%s",
+                   handle->numFds, handle->numInts, m, hnd->hal_format, hnd->pixel_stride, ints);
+      }
+      const uint32_t req_bpp = get_hal_format_bpp(hnd->hal_format);
+      const int req_fourcc = get_fourcc_from_hal_format(hnd->hal_format);
+      const int req_fd = largest_handle_fd(handle);
+      if (!req_bpp || req_fourcc == -1 || hnd->pixel_stride <= 0 || req_fd < 0 ||
+          is_hal_format_yuv(hnd->hal_format))
+         return -EINVAL;
+      out->drm_fourcc = req_fourcc;
+      out->modifier = DRM_FORMAT_MOD_LINEAR;
+      out->num_planes = 1;
+      out->fds[0] = req_fd;
+      out->offsets[0] = 0;
+      out->strides[0] = hnd->pixel_stride * req_bpp;
+      return 0;
    }
    const uint32_t stride = h[plane0];
    const int af = plane0 - ARM_HND_ALLOC_FORMAT_BACK;
@@ -398,7 +463,9 @@ fallback_gralloc_get_buffer_info(struct u_gralloc *gralloc,
    out->drm_fourcc = drm_fourcc;
    out->modifier = DRM_FORMAT_MOD_INVALID;
    out->num_planes = num_planes;
-   out->fds[0] = hnd->handle->data[0];
+   out->fds[0] = largest_handle_fd(hnd->handle);
+   if (out->fds[0] < 0)
+      out->fds[0] = hnd->handle->data[0];
    out->strides[0] = stride;
 
 #ifdef HAS_FREEDRENO

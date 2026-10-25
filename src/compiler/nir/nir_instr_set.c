@@ -29,6 +29,14 @@
 #define XXH_INLINE_ALL
 #include "util/xxhash.h"
 
+static bool
+intrin_cb_true(const nir_intrinsic_instr *intr, const void *data)
+{
+   (void)intr;
+   (void)data;
+   return true;
+}
+
 /* This function determines if uses of an instruction can safely be rewritten
  * to use another identical instruction instead. Note that this function must
  * be kept in sync with hash_instr() and nir_instrs_equal() -- only
@@ -36,7 +44,7 @@
  * conversely they must handle everything that this function returns true for.
  */
 static bool
-instr_can_rewrite(const nir_instr *instr)
+instr_can_rewrite(const nir_instr *instr, nir_intrin_filter_cb allow_additional_intrin, const void *cb_data)
 {
    switch (instr->type) {
    case nir_instr_type_alu:
@@ -62,16 +70,10 @@ instr_can_rewrite(const nir_instr *instr)
           * CSE is inclined to without a problem.
           */
          return true;
-      case nir_intrinsic_terminate:
-      case nir_intrinsic_terminate_if:
-      case nir_intrinsic_demote:
-      case nir_intrinsic_demote_if:
-         /* If a terminate/demote dominates another with the same source,
-          * the second won't affect additional invocations.
-          */
-         return true;
       default:
-         return nir_intrinsic_can_reorder(intr);
+         if (nir_intrinsic_can_reorder(intr))
+            return true;
+         return allow_additional_intrin && allow_additional_intrin(intr, cb_data);
       }
    }
    case nir_instr_type_call:
@@ -314,7 +316,6 @@ pack_tex(const nir_tex_instr *instr)
    PACK(instr->texture_non_uniform, 1);
    PACK(instr->sampler_non_uniform, 1);
    PACK(instr->embedded_sampler, 1);
-   PACK(instr->offset_non_uniform, 1);
 
 #undef PACK
 
@@ -324,7 +325,7 @@ pack_tex(const nir_tex_instr *instr)
 static uint32_t
 hash_tex(uint32_t hash, const nir_tex_instr *instr)
 {
-   uint8_t v[24];
+   uint8_t v[28];
    uint32_t packed = pack_tex(instr);
    memcpy(v, &packed, 4);
    STATIC_ASSERT(sizeof(instr->tg4_offsets) == 8);
@@ -332,9 +333,11 @@ hash_tex(uint32_t hash, const nir_tex_instr *instr)
    uint32_t texture_index = instr->texture_index;
    uint32_t sampler_index = instr->sampler_index;
    uint32_t backend_flags = instr->backend_flags;
+   uint32_t dest = (instr->def.num_components << 8) | instr->dest_type;
    memcpy(v + 12, &texture_index, 4);
    memcpy(v + 16, &sampler_index, 4);
    memcpy(v + 20, &backend_flags, 4);
+   memcpy(v + 24, &dest, 4);
    hash = XXH32(v, sizeof(v), hash);
 
    for (unsigned i = 0; i < instr->num_srcs; i++)
@@ -588,7 +591,8 @@ nir_alu_srcs_equal(const nir_alu_instr *alu1, const nir_alu_instr *alu2,
 bool
 nir_instrs_equal(const nir_instr *instr1, const nir_instr *instr2)
 {
-   assert(instr_can_rewrite(instr1) && instr_can_rewrite(instr2));
+   assert(instr_can_rewrite(instr1, intrin_cb_true, NULL) &&
+          instr_can_rewrite(instr2, intrin_cb_true, NULL));
 
    if (instr1->type != instr2->type)
       return false;
@@ -705,7 +709,9 @@ nir_instrs_equal(const nir_instr *instr1, const nir_instr *instr2)
 
       if (tex1->texture_index != tex2->texture_index ||
           tex1->sampler_index != tex2->sampler_index ||
-          tex1->backend_flags != tex2->backend_flags)
+          tex1->backend_flags != tex2->backend_flags ||
+          tex1->def.num_components != tex2->def.num_components ||
+          tex1->dest_type != tex2->dest_type)
          return false;
 
       return true;
@@ -827,10 +833,12 @@ nir_instr_set_fini(struct set *instr_set)
 
 nir_instr *
 nir_instr_set_add_or_rewrite(struct set *instr_set, nir_instr *instr,
+                             nir_intrin_filter_cb allow_additional_intrin,
+                             const void *intrin_data,
                              bool (*cond_function)(const nir_instr *a,
                                                    const nir_instr *b))
 {
-   if (!instr_can_rewrite(instr))
+   if (!instr_can_rewrite(instr, allow_additional_intrin, intrin_data))
       return NULL;
 
    struct set_entry *e = _mesa_set_search_or_add(instr_set, instr, NULL);
@@ -879,7 +887,7 @@ nir_instr_set_add_or_rewrite(struct set *instr_set, nir_instr *instr,
 void
 nir_instr_set_remove(struct set *instr_set, nir_instr *instr)
 {
-   if (!instr_can_rewrite(instr))
+   if (!instr_can_rewrite(instr, intrin_cb_true, NULL))
       return;
 
    struct set_entry *entry = _mesa_set_search(instr_set, instr);

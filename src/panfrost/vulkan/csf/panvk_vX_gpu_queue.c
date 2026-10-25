@@ -1,5 +1,6 @@
 /*
  * Copyright © 2024 Collabora Ltd.
+ * Copyright © 2026 NXP
  * SPDX-License-Identifier: MIT
  */
 
@@ -17,7 +18,11 @@
 
 #include "pan_trace.h"
 
+#include "kmod/pan_kmod.h"
+#include "kmod/kbase_kmod.h"
+
 #include "util/bitscan.h"
+#include "util/log.h"
 #include "vk_drm_syncobj.h"
 #include "vk_log.h"
 
@@ -44,7 +49,11 @@ finish_render_desc_ringbuf(struct panvk_gpu_queue *queue)
                                ringbuf->size);
    }
 
-   if (ringbuf->addr.dev) {
+   if (ringbuf->addr.dev && pan_kmod_dev_is_kbase(dev->kmod.dev)) {
+      panvk_address_binding_report(dev, NULL, ringbuf->addr.dev, ringbuf->size,
+                                   VK_DEVICE_ADDRESS_BINDING_TYPE_UNBIND_EXT);
+      pan_kmod_kbase_unmap_repeated(ringbuf->bo, ringbuf->addr.dev, 2);
+   } else if (ringbuf->addr.dev) {
       panvk_address_binding_report(dev, NULL, ringbuf->addr.dev, ringbuf->size,
                                    VK_DEVICE_ADDRESS_BINDING_TYPE_UNBIND_EXT);
 
@@ -60,8 +69,7 @@ finish_render_desc_ringbuf(struct panvk_gpu_queue *queue)
          pan_kmod_vm_bind(dev->kmod.vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE, &op, 1);
       assert(!ret);
 
-      panvk_as_free(dev, dev->as.priv_heap, ringbuf->addr.dev,
-                    ringbuf->size * 2);
+      panvk_as_free(dev, ringbuf->addr.dev, ringbuf->size * 2);
    }
 
    if (ringbuf->addr.host) {
@@ -86,7 +94,9 @@ init_render_desc_ringbuf(struct panvk_gpu_queue *queue)
    if (tracing_enabled) {
       ringbuf->size = debug_get_num_option("PANVK_DESC_TRACEBUF_SIZE",
                                            DEFAULT_DESC_TRACEBUF_SIZE);
-      flags |= PAN_KMOD_BO_FLAG_GPU_UNCACHED;
+      /* kbase cannot alias GPU-uncached memory (the two views below). */
+      if (!pan_kmod_dev_is_kbase(dev->kmod.dev))
+         flags |= PAN_KMOD_BO_FLAG_GPU_UNCACHED;
       assert(ringbuf->size > MIN_DESC_TRACEBUF_SIZE &&
              util_is_power_of_two_nonzero(ringbuf->size));
    } else {
@@ -107,10 +117,24 @@ init_render_desc_ringbuf(struct panvk_gpu_queue *queue)
                              "Failed to CPU map ringbuf BO");
    }
 
+   /* kbase assigns VAs itself: the two back-to-back views are one MEM_ALIAS region, placed at
+    * the same alignment. */
+   if (pan_kmod_dev_is_kbase(dev->kmod.dev)) {
+      dev_addr = pan_kmod_kbase_bo_map_repeated(ringbuf->bo, 2,
+                                                MIN2(ringbuf->size * 2, 2 * 1024 * 1024));
+      if (!dev_addr)
+         return panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                             "Failed to map the descriptor ring buffer twice");
+      ringbuf->addr.dev = dev_addr;
+      panvk_address_binding_report(dev, NULL, ringbuf->addr.dev, ringbuf->size,
+                                   VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT);
+      goto init_syncobj;
+   }
+
    /* We choose the alignment to guarantee that we won't ever cross a 4G
     * boundary when accessing the mapping. This way we can encode the wraparound
     * using 32-bit operations. */
-   dev_addr = panvk_as_alloc(dev, dev->as.priv_heap, ringbuf->size * 2,
+   dev_addr = panvk_as_alloc(dev, PANVK_NO_EXEC_VA_HEAP, ringbuf->size * 2,
                              ringbuf->size * 2);
 
    if (!dev_addr)
@@ -147,7 +171,7 @@ init_render_desc_ringbuf(struct panvk_gpu_queue *queue)
    ret = pan_kmod_vm_bind(dev->kmod.vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE, vm_ops,
                           tracing_enabled ? 1 : ARRAY_SIZE(vm_ops));
    if (ret) {
-      panvk_as_free(dev, dev->as.priv_heap, dev_addr, ringbuf->size * 2);
+      panvk_as_free(dev, dev_addr, ringbuf->size * 2);
       return panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                           "Failed to GPU map ringbuf BO");
    }
@@ -166,12 +190,13 @@ init_render_desc_ringbuf(struct panvk_gpu_queue *queue)
                                ringbuf->addr.host, ringbuf->size, NULL);
    }
 
+init_syncobj:;
    struct panvk_pool_alloc_info alloc_info = {
       .size = sizeof(struct panvk_cs_sync32),
       .alignment = 64,
    };
 
-   ringbuf->syncobj = panvk_pool_alloc_mem(&dev->mempools.rw, alloc_info);
+   ringbuf->syncobj = panvk_pool_alloc_mem(&dev->mempools.sync, alloc_info);
    if (!panvk_priv_mem_check_alloc(ringbuf->syncobj))
       return panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                           "Failed to create the render desc ringbuf context");
@@ -192,7 +217,7 @@ finish_subqueue_tracing(struct panvk_gpu_queue *queue,
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
    struct panvk_subqueue *subq = &queue->subqueues[subqueue];
 
-   if (subq->tracebuf.addr.dev) {
+   if (subq->tracebuf.addr.dev && !pan_kmod_dev_is_kbase(dev->kmod.dev)) {
       uint64_t pgsize = panvk_get_gpu_page_size(dev);
 
       panvk_address_binding_report(dev, NULL, subq->tracebuf.addr.dev,
@@ -214,8 +239,7 @@ finish_subqueue_tracing(struct panvk_gpu_queue *queue,
          pan_kmod_vm_bind(dev->kmod.vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE, &op, 1);
       assert(!ret);
 
-      panvk_as_free(dev, dev->as.priv_heap, subq->tracebuf.addr.dev,
-                    subq->tracebuf.size + pgsize);
+      panvk_as_free(dev, subq->tracebuf.addr.dev, subq->tracebuf.size + pgsize);
    }
 
    if (subq->tracebuf.addr.host) {
@@ -267,9 +291,25 @@ init_subqueue_tracing(struct panvk_gpu_queue *queue,
                           "Failed to CPU map tracebuf");
    }
 
+   /* kbase places the BO itself; no guard page there. */
+   if (pan_kmod_dev_is_kbase(dev->kmod.dev)) {
+      struct pan_kmod_vm_op op = {
+         .type = PAN_KMOD_VM_OP_TYPE_MAP,
+         .va = {.start = PAN_KMOD_VM_MAP_AUTO_VA, .size = subq->tracebuf.size},
+         .map = {.bo = subq->tracebuf.bo},
+      };
+      if (pan_kmod_vm_bind(dev->kmod.vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE, &op, 1))
+         return panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY, "Failed to map tracebuf");
+      subq->tracebuf.addr.dev = op.va.start;
+      if (dev->debug.decode_ctx)
+         pandecode_inject_mmap(dev->debug.decode_ctx, subq->tracebuf.addr.dev,
+                               subq->tracebuf.addr.host, subq->tracebuf.size, NULL);
+      return VK_SUCCESS;
+   }
+
    /* Add a guard page. */
    uint64_t pgsize = panvk_get_gpu_page_size(dev);
-   dev_addr = panvk_as_alloc(dev, dev->as.priv_heap,
+   dev_addr = panvk_as_alloc(dev, PANVK_NO_EXEC_VA_HEAP,
                              subq->tracebuf.size + pgsize, pgsize);
 
    if (!dev_addr)
@@ -293,8 +333,7 @@ init_subqueue_tracing(struct panvk_gpu_queue *queue,
    int ret =
       pan_kmod_vm_bind(dev->kmod.vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE, &vm_op, 1);
    if (ret) {
-      panvk_as_free(dev, dev->as.priv_heap, dev_addr,
-                    subq->tracebuf.size + pgsize);
+      panvk_as_free(dev, dev_addr, subq->tracebuf.size + pgsize);
       return panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                           "Failed to GPU map ringbuf BO");
    }
@@ -531,6 +570,22 @@ init_subqueue(struct panvk_gpu_queue *queue, enum panvk_subqueue_id subqueue)
 
    panvk_priv_mem_flush(queue->tiler_heap.desc, 4096, cs_root_chunk_size(&b));
 
+   if (queue->kbase_group) {
+      const struct pan_kmod_kbase_cs_call call = {
+         .queue = subqueue,
+         .size = cs_root_chunk_size(&b),
+         .addr = cs_root_chunk_gpu_addr(&b),
+      };
+      cs_builder_fini(&b);
+      const uint64_t seq =
+         pan_kmod_kbase_csf_submit(queue->kbase_group, &call, 1, 0, 0, NULL, NULL);
+      if (!seq || !pan_kmod_kbase_csf_wait(queue->kbase_group, seq, INT64_MAX) ||
+          pan_kmod_kbase_csf_group_faulted(queue->kbase_group))
+         return panvk_errorf(dev->vk.physical, VK_ERROR_INITIALIZATION_FAILED,
+                             "Failed to initialize subqueue %d", subqueue);
+      return VK_SUCCESS;
+   }
+
    struct drm_panthor_sync_op syncop = {
       .flags =
          DRM_PANTHOR_SYNC_OP_HANDLE_TYPE_SYNCOBJ | DRM_PANTHOR_SYNC_OP_SIGNAL,
@@ -559,13 +614,13 @@ init_subqueue(struct panvk_gpu_queue *queue, enum panvk_subqueue_id subqueue)
       return panvk_errorf(dev->vk.physical, VK_ERROR_INITIALIZATION_FAILED,
                           "Failed to initialized subqueue: %m");
 
-   ret = drmSyncobjWait(dev->drm_fd, &queue->syncobj_handle, 1, INT64_MAX, 0,
-                        NULL);
+   ret = pan_kmod_sync_wait(dev->kmod.dev, &queue->syncobj_handle, 1, INT64_MAX, 0,
+                            NULL);
    if (ret)
       return panvk_errorf(dev->vk.physical, VK_ERROR_INITIALIZATION_FAILED,
                           "SyncobjWait failed: %m");
 
-   drmSyncobjReset(dev->drm_fd, &queue->syncobj_handle, 1);
+   pan_kmod_sync_reset(dev->kmod.dev, &queue->syncobj_handle, 1);
 
    if (PANVK_DEBUG(TRACE)) {
       pandecode_user_msg(dev->debug.decode_ctx, "Init subqueue %d binary\n\n",
@@ -606,7 +661,7 @@ init_queue(struct panvk_gpu_queue *queue)
       .alignment = 64,
    };
 
-   queue->syncobjs = panvk_pool_alloc_mem(&dev->mempools.rw, alloc_info);
+   queue->syncobjs = panvk_pool_alloc_mem(&dev->mempools.sync, alloc_info);
    if (!panvk_priv_mem_check_alloc(queue->syncobjs))
       return panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                           "Failed to allocate subqueue sync objects");
@@ -615,9 +670,11 @@ init_queue(struct panvk_gpu_queue *queue)
    if (result != VK_SUCCESS)
       goto err_cleanup_queue;
 
-   result = init_utrace(queue);
-   if (result != VK_SUCCESS)
-      goto err_cleanup_queue;
+   if (!queue->kbase_group) {
+      result = init_utrace(queue);
+      if (result != VK_SUCCESS)
+         goto err_cleanup_queue;
+   }
 
    for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
       result = init_subqueue(queue, i);
@@ -670,6 +727,23 @@ create_group(struct panvk_gpu_queue *queue,
       max_fragment_cores = MIN2(shader_core_count, max_fragment_cores);
    }
 
+   if (pan_kmod_dev_is_kbase(dev->kmod.dev)) {
+      static const uint8_t kbase_prio[] = {
+         [PANTHOR_GROUP_PRIORITY_LOW] = PAN_KMOD_KBASE_CSF_PRIORITY_LOW,
+         [PANTHOR_GROUP_PRIORITY_MEDIUM] = PAN_KMOD_KBASE_CSF_PRIORITY_MEDIUM,
+         [PANTHOR_GROUP_PRIORITY_HIGH] = PAN_KMOD_KBASE_CSF_PRIORITY_HIGH,
+         [PANTHOR_GROUP_PRIORITY_REALTIME] = PAN_KMOD_KBASE_CSF_PRIORITY_REALTIME,
+      };
+      queue->kbase_group = pan_kmod_kbase_csf_group_create(
+         dev->kmod.dev, PANVK_SUBQUEUE_COUNT, phys_dev->compute_core_mask,
+         phys_dev->fragment_core_mask, max_compute_cores, max_fragment_cores,
+         kbase_prio[group_priority]);
+      if (!queue->kbase_group)
+         return panvk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
+                             "Failed to create a scheduling group");
+      return VK_SUCCESS;
+   }
+
    struct drm_panthor_group_create gc = {
       .compute_core_mask = phys_dev->compute_core_mask,
       .fragment_core_mask = phys_dev->fragment_core_mask,
@@ -695,6 +769,13 @@ static void
 destroy_group(struct panvk_gpu_queue *queue)
 {
    const struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+
+   if (queue->kbase_group) {
+      pan_kmod_kbase_csf_group_destroy(queue->kbase_group);
+      queue->kbase_group = NULL;
+      return;
+   }
+
    struct drm_panthor_group_destroy gd = {
       .group_handle = queue->group_handle,
    };
@@ -744,6 +825,27 @@ init_tiler(struct panvk_gpu_queue *queue)
       goto err_free_desc;
    }
 
+   if (pan_kmod_dev_is_kbase(dev->kmod.dev)) {
+      uint64_t first_chunk;
+      if (!pan_kmod_kbase_csf_tiler_heap_create(
+             dev->kmod.dev, tiler_heap->chunk_size, phys_dev->csf.tiler.initial_chunks,
+             phys_dev->csf.tiler.max_chunks, 65535, &tiler_heap->context.dev_addr,
+             &first_chunk)) {
+         result = panvk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
+                               "Failed to create a tiler heap context");
+         goto err_free_desc;
+      }
+      tiler_heap->context.handle = 0;
+
+      panvk_priv_mem_write_desc(tiler_heap->desc, 0, TILER_HEAP, cfg) {
+         cfg.size = tiler_heap->chunk_size;
+         cfg.base = first_chunk;
+         cfg.bottom = cfg.base + 64;
+         cfg.top = cfg.base + cfg.size;
+      }
+      return VK_SUCCESS;
+   }
+
    struct drm_panthor_tiler_heap_create thc = {
       .vm_id = pan_kmod_vm_handle(dev->kmod.vm),
       .chunk_size = tiler_heap->chunk_size,
@@ -783,12 +885,17 @@ cleanup_tiler(struct panvk_gpu_queue *queue)
 {
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
    struct panvk_tiler_heap *tiler_heap = &queue->tiler_heap;
-   struct drm_panthor_tiler_heap_destroy thd = {
-      .handle = tiler_heap->context.handle,
-   };
-   ASSERTED int ret =
-      pan_kmod_ioctl(dev->drm_fd, DRM_IOCTL_PANTHOR_TILER_HEAP_DESTROY, &thd);
-   assert(!ret);
+
+   if (pan_kmod_dev_is_kbase(dev->kmod.dev)) {
+      pan_kmod_kbase_csf_tiler_heap_destroy(dev->kmod.dev, tiler_heap->context.dev_addr);
+   } else {
+      struct drm_panthor_tiler_heap_destroy thd = {
+         .handle = tiler_heap->context.handle,
+      };
+      ASSERTED int ret =
+         pan_kmod_ioctl(dev->drm_fd, DRM_IOCTL_PANTHOR_TILER_HEAP_DESTROY, &thd);
+      assert(!ret);
+   }
 
    panvk_pool_free_mem(&tiler_heap->desc);
    panvk_pool_free_mem(&tiler_heap->oom_fbd);
@@ -848,7 +955,7 @@ panvk_queue_submit_init(struct panvk_queue_submit *submit,
    submit->force_sync = PANVK_DEBUG(TRACE) || PANVK_DEBUG(SYNC);
 }
 
-static void
+static VkResult
 panvk_queue_submit_init_storage(
    struct panvk_queue_submit *submit, const struct vk_queue_submit *vk_submit,
    struct panvk_queue_submit_stack_storage *stack_storage)
@@ -952,10 +1059,15 @@ panvk_queue_submit_init_storage(
       submit->qsubmit_count <= ARRAY_SIZE(stack_storage->qsubmits)
          ? stack_storage->qsubmits
          : malloc(sizeof(*submit->qsubmits) * submit->qsubmit_count);
+   if (!submit->qsubmits)
+      return panvk_error(submit->dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    submit->wait_ops = syncop_count <= ARRAY_SIZE(stack_storage->syncops)
                          ? stack_storage->syncops
                          : malloc(sizeof(*submit->wait_ops) * syncop_count);
+   if (!submit->wait_ops)
+      return panvk_error(submit->dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
    submit->signal_ops = submit->wait_ops + vk_submit->wait_count;
 
    /* reset so that we can initialize submit->qsubmits incrementally */
@@ -965,7 +1077,11 @@ panvk_queue_submit_init_storage(
       submit->utrace.data_storage =
          malloc(sizeof(*submit->utrace.data_storage) *
                 util_bitcount(submit->utrace.queue_mask));
+      if (!submit->utrace.data_storage)
+         return panvk_error(submit->dev, VK_ERROR_OUT_OF_HOST_MEMORY);
    }
+
+   return VK_SUCCESS;
 }
 
 static void
@@ -1109,24 +1225,18 @@ panvk_queue_submit_init_cmdbufs(struct panvk_queue_submit *submit,
          struct u_trace clone_ut;
          if (!(cmdbuf->flags & VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)) {
             u_trace_init(&clone_ut, &dev->utrace.utctx);
-
-            const uint64_t root_buf_size = sizeof(uint64_t) * 1024;
-            struct panvk_utrace_buf *cs_root_buf =
-               panvk_utrace_create_buffer(&dev->utrace.utctx, root_buf_size);
-            assert(cs_root_buf);
             /* For every sq, the cs buffer needs to be freed. */
             free_data = true;
 
-            const struct cs_buffer cs_root = (struct cs_buffer){
-               .cpu = cs_root_buf->host,
-               .gpu = cs_root_buf->dev,
-               .capacity = root_buf_size / sizeof(uint64_t),
+            /* The clone CS builder allocates all of its chunks (including the
+             * root) from the utrace copy heap via alloc_clone_cs_buffer(). */
+            struct panvk_utrace_clone_cs_ctx clone_ctx = {
+               .dev = dev,
             };
-
-            submit->utrace.data[j]->clone_cs_root = cs_root_buf;
+            util_dynarray_init(&clone_ctx.cs_bufs, NULL);
             struct cs_builder clone_builder;
             panvk_per_arch(utrace_clone_init_builder)(&clone_builder, dev,
-                                                      &cs_root);
+                                                      &clone_ctx);
 
             u_trace_clone_append(
                u_trace_begin_iterator(ut), u_trace_end_iterator(ut), &clone_ut,
@@ -1134,15 +1244,25 @@ panvk_queue_submit_init_cmdbufs(struct panvk_queue_submit *submit,
 
             panvk_per_arch(utrace_clone_finish_builder)(&clone_builder);
 
-            submit->qsubmits[submit->qsubmit_count++] =
-               (struct drm_panthor_queue_submit){
-                  .queue_index = j,
-                  .stream_size = cs_root_chunk_size(&clone_builder),
-                  .stream_addr = cs_root_chunk_gpu_addr(&clone_builder),
-                  .latest_flush = flush_id,
-               };
+            submit->utrace.data[j]->clone_cs_bufs = clone_ctx.cs_bufs;
 
-            ut = &clone_ut;
+            /* A mid-build overflow allocation failure leaves the builder
+             * invalid; flush the original instead of submitting a broken CS. */
+            if (!cs_is_valid(&clone_builder)) {
+               mesa_loge("utrace: clone CS builder invalid (allocation failed "
+                         "mid-build); dropping trace for this submit");
+               u_trace_fini(&clone_ut);
+            } else {
+               submit->qsubmits[submit->qsubmit_count++] =
+                  (struct drm_panthor_queue_submit){
+                     .queue_index = j,
+                     .stream_size = cs_root_chunk_size(&clone_builder),
+                     .stream_addr = cs_root_chunk_gpu_addr(&clone_builder),
+                     .latest_flush = flush_id,
+                  };
+
+               ut = &clone_ut;
+            }
          }
 
          u_trace_flush(ut, submit->utrace.data[j], dev->vk.current_frame,
@@ -1233,9 +1353,9 @@ panvk_queue_submit_process_signals(struct panvk_queue_submit *submit,
 
    if (submit->force_sync) {
       uint64_t point = util_bitcount(submit->signal_queue_mask);
-      ret = drmSyncobjTimelineWait(dev->drm_fd, &queue->syncobj_handle,
-                                   &point, 1, INT64_MAX,
-                                   DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
+      ret = pan_kmod_sync_timeline_wait(dev->kmod.dev, &queue->syncobj_handle,
+                                        &point, 1, INT64_MAX,
+                                        DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
       assert(!ret);
    }
 
@@ -1245,23 +1365,23 @@ panvk_queue_submit_process_signals(struct panvk_queue_submit *submit,
          vk_sync_as_drm_syncobj(signal->sync);
       assert(syncobj);
 
-      drmSyncobjTransfer(dev->drm_fd, syncobj->syncobj, signal->signal_value,
-                         queue->syncobj_handle, 0, 0);
+      pan_kmod_sync_transfer(dev->kmod.dev, syncobj->syncobj,
+                             signal->signal_value, queue->syncobj_handle, 0, 0);
    }
 
    if (submit->utrace.queue_mask) {
       const struct vk_drm_syncobj *syncobj =
          vk_sync_as_drm_syncobj(queue->utrace.sync);
 
-      drmSyncobjTransfer(dev->drm_fd, syncobj->syncobj,
-                         queue->utrace.next_value++, queue->syncobj_handle, 0,
-                         0);
+      pan_kmod_sync_transfer(dev->kmod.dev, syncobj->syncobj,
+                             queue->utrace.next_value++, queue->syncobj_handle,
+                             0, 0);
 
       /* process flushed events after the syncobj is set up */
       u_trace_context_process(&dev->utrace.utctx, false);
    }
 
-   drmSyncobjReset(dev->drm_fd, &queue->syncobj_handle, 1);
+   pan_kmod_sync_reset(dev->kmod.dev, &queue->syncobj_handle, 1);
 }
 
 static void
@@ -1338,6 +1458,222 @@ panvk_queue_submit_process_debug(const struct panvk_queue_submit *submit,
       panvk_per_arch(gpu_queue_check_status)(&queue->vk);
 }
 
+/* PANVK_DEBUG=trace on kbase: the command buffers' streams and the CS traces, once the
+ * submission is done. The ring's own instructions are not decoded. */
+static void
+panvk_queue_kbase_decode(struct panvk_gpu_queue *queue, const struct vk_queue_submit *vk_submit)
+{
+   struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+   struct pandecode_context *decode_ctx = dev->debug.decode_ctx;
+   const uint64_t gpu_id = dev->kmod.dev->props.gpu_id;
+
+   for (uint32_t i = 0; i < vk_submit->command_buffer_count; i++) {
+      struct panvk_cmd_buffer *cmdbuf =
+         container_of(vk_submit->command_buffers[i], struct panvk_cmd_buffer, vk);
+      panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
+      for (uint32_t j = 0; j < PANVK_SUBQUEUE_COUNT; j++) {
+         struct cs_builder *b = panvk_get_cs_builder(cmdbuf, j);
+         if (cs_is_empty(b))
+            continue;
+         pandecode_user_msg(decode_ctx, "CS of cmdbuf %u on subqueue %u\n\n", i, j);
+         pandecode_cs_binary(decode_ctx, cs_root_chunk_gpu_addr(b), cs_root_chunk_size(b),
+                             gpu_id);
+      }
+   }
+
+   for (uint32_t i = 0; i < ARRAY_SIZE(queue->subqueues); i++) {
+      panvk_priv_mem_readback(queue->subqueues[i].context, 0,
+                              struct panvk_cs_subqueue_context, ctx) {
+         const size_t trace_size =
+            ctx->debug.tracebuf.cs - queue->subqueues[i].tracebuf.addr.dev;
+         if (trace_size) {
+            pandecode_user_msg(decode_ctx, "\nCS traces on subqueue %u\n\n", i);
+            pandecode_cs_trace(decode_ctx, queue->subqueues[i].tracebuf.addr.dev, trace_size,
+                               gpu_id);
+         }
+      }
+      panvk_priv_mem_rmw(queue->subqueues[i].context, 0, struct panvk_cs_subqueue_context,
+                         ctx) {
+         if (ctx->render.desc_ringbuf.ptr) {
+            ctx->render.desc_ringbuf.ptr = queue->render_desc_ringbuf.addr.dev;
+            ctx->render.desc_ringbuf.pos = 0;
+         }
+         if (ctx->debug.tracebuf.cs)
+            ctx->debug.tracebuf.cs = queue->subqueues[i].tracebuf.addr.dev;
+      }
+   }
+   pandecode_next_frame(decode_ctx);
+}
+
+/* What a kbase submission still has to do once the GPU is done with it. */
+struct panvk_kbase_csf_done {
+   struct panvk_gpu_queue *queue;
+   uint32_t nr_signals;
+   uint32_t signals[];
+};
+
+/* On the kmod's CSF event thread, once every subqueue is past the submission. */
+static void
+panvk_kbase_csf_done(void *data, bool ok)
+{
+   struct panvk_kbase_csf_done *d = data;
+   struct panvk_device *dev = to_panvk_device(d->queue->vk.base.device);
+
+   if (!ok)
+      d->queue->kbase_lost = true;
+   if (d->nr_signals)
+      dev->vk.sync->signal(dev->vk.sync, d->signals, d->nr_signals);
+   free(d);
+}
+
+/*
+ * kbase CSF: the command streams of every command buffer go into the subqueues' rings through
+ * the kmod (pan_kmod_kbase_csf_submit), which also appends a completion signal on all three
+ * subqueues, so the submission completes when all of the queue's earlier work has too. Waits
+ * are done here, on the CPU, to completion: kbase has no syncobj the firmware could wait on,
+ * and a wait that only saw the signal submitted could let this submission's subqueues run
+ * alongside the producer's remaining ones.
+ */
+static VkResult
+panvk_queue_submit_kbase(struct panvk_gpu_queue *queue, struct vk_queue_submit *vk_submit)
+{
+   struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+
+   if (queue->kbase_lost || pan_kmod_kbase_csf_group_faulted(queue->kbase_group))
+      return vk_queue_set_lost(&queue->vk, "kbase: the queue group faulted");
+
+   uint64_t wait_seq = 0;
+   if (vk_submit->wait_count) {
+      uint32_t waits[vk_submit->wait_count];
+      for (uint32_t i = 0; i < vk_submit->wait_count; i++)
+         waits[i] = vk_sync_as_drm_syncobj(vk_submit->waits[i].sync)->syncobj;
+
+      /* Nothing for the GPU to run (a present's release, a semaphore hand-off): the signals
+       * stand for the waits, as one sync file, so nobody blocks here. */
+      if (!vk_submit->command_buffer_count && vk_submit->signal_count) {
+         const int fd = pan_kmod_kbase_sync_merged_fd(waits, vk_submit->wait_count);
+         if (fd != -2) {
+            for (uint32_t i = 0; i < vk_submit->signal_count; i++) {
+               const uint32_t h = vk_sync_as_drm_syncobj(vk_submit->signals[i].sync)->syncobj;
+               if (fd >= 0)
+                  dev->vk.sync->import_sync_file(dev->vk.sync, h, fd);
+               else
+                  dev->vk.sync->signal(dev->vk.sync, &h, 1);
+            }
+            if (fd >= 0)
+               close(fd);
+            return VK_SUCCESS;
+         }
+      }
+
+      /* Signaled by our own earlier submissions: the rings wait for them on the GPU. */
+      if (!pan_kmod_kbase_sync_csf_wait_seq(waits, vk_submit->wait_count, queue->kbase_group,
+                                            &wait_seq))
+         dev->vk.sync->wait(dev->vk.sync, waits, vk_submit->wait_count, INT64_MAX,
+                            DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
+   }
+
+   unsigned max_calls = PANVK_SUBQUEUE_COUNT;
+   for (uint32_t i = 0; i < vk_submit->command_buffer_count; i++)
+      max_calls += PANVK_SUBQUEUE_COUNT;
+   struct pan_kmod_kbase_cs_call *calls = malloc(max_calls * sizeof(*calls));
+   struct panvk_kbase_csf_done *d =
+      malloc(sizeof(*d) + vk_submit->signal_count * sizeof(uint32_t));
+   if (!calls || !d) {
+      free(calls);
+      free(d);
+      return vk_queue_set_lost(&queue->vk, "out of memory submitting");
+   }
+   unsigned nr_calls = 0;
+
+   /* Resources a subqueue has not asked the firmware for yet come first. */
+   for (uint32_t i = 0; i < vk_submit->command_buffer_count; i++) {
+      struct panvk_cmd_buffer *cmdbuf =
+         container_of(vk_submit->command_buffers[i], struct panvk_cmd_buffer, vk);
+      for (uint32_t j = 0; j < PANVK_SUBQUEUE_COUNT; j++) {
+         struct cs_builder *b = panvk_get_cs_builder(cmdbuf, j);
+         struct panvk_subqueue *subq = &queue->subqueues[j];
+         if (cs_is_empty(b) || !(b->req_resource_mask & ~subq->req_resource.mask))
+            continue;
+         calls[nr_calls++] = (struct pan_kmod_kbase_cs_call){
+            .queue = j,
+            .size = subq->req_resource.cs_buffer_size,
+            .addr = subq->req_resource.cs_buffer_addr,
+         };
+         subq->req_resource.mask = get_resource_mask(j);
+      }
+   }
+
+   for (uint32_t i = 0; i < vk_submit->command_buffer_count; i++) {
+      struct panvk_cmd_buffer *cmdbuf =
+         container_of(vk_submit->command_buffers[i], struct panvk_cmd_buffer, vk);
+      for (uint32_t j = 0; j < PANVK_SUBQUEUE_COUNT; j++) {
+         struct cs_builder *b = panvk_get_cs_builder(cmdbuf, j);
+         assert(cs_is_valid(b));
+         if (cs_is_empty(b))
+            continue;
+         calls[nr_calls++] = (struct pan_kmod_kbase_cs_call){
+            .queue = j,
+            .size = cs_root_chunk_size(b),
+            .addr = cs_root_chunk_gpu_addr(b),
+         };
+      }
+   }
+
+   d->queue = queue;
+   d->nr_signals = vk_submit->signal_count;
+   for (uint32_t i = 0; i < vk_submit->signal_count; i++)
+      d->signals[i] = vk_sync_as_drm_syncobj(vk_submit->signals[i].sync)->syncobj;
+
+   /* Before submitting: the completion may run before the submit even returns. */
+   pan_kmod_kbase_sync_submitted(d->signals, d->nr_signals);
+   pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
+
+   const uint64_t seq =
+      pan_kmod_kbase_csf_submit(queue->kbase_group, calls, nr_calls,
+                                BITFIELD_MASK(PANVK_SUBQUEUE_COUNT), wait_seq,
+                                panvk_kbase_csf_done, d);
+   free(calls);
+   if (!seq) {
+      /* Signal anyway, so nothing waits forever on work that was never sent. */
+      panvk_kbase_csf_done(d, false);
+      return vk_queue_set_lost(&queue->vk, "kbase: the submission was refused");
+   }
+
+   /* A sync file for what this submission signals, so exporting one (a present, a fence fd)
+    * hands the wait to whoever consumes it instead of blocking the CPU here. d may already be
+    * freed by the event thread: the handles come from the submit info. */
+   if (vk_submit->signal_count) {
+      uint32_t handles[vk_submit->signal_count];
+      for (uint32_t i = 0; i < vk_submit->signal_count; i++)
+         handles[i] = vk_sync_as_drm_syncobj(vk_submit->signals[i].sync)->syncobj;
+      pan_kmod_kbase_sync_attach_csf(handles, vk_submit->signal_count, queue->kbase_group, seq);
+      const int fd = pan_kmod_kbase_csf_fence_fd(queue->kbase_group, seq);
+      if (fd >= 0) {
+         pan_kmod_kbase_sync_attach_fd(handles, vk_submit->signal_count, fd);
+         close(fd);
+      }
+   }
+
+   if (PANVK_DEBUG(SYNC) || PANVK_DEBUG(TRACE)) {
+      /* Tracing a submission that never completes still shows what it ran. */
+      struct timespec ts;
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+      const bool waited = pan_kmod_kbase_csf_wait(queue->kbase_group, seq,
+                              (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec + 3000000000ll);
+      const struct panvk_cs_sync64 *so = panvk_priv_mem_host_addr(queue->syncobjs);
+      mesa_logi("kbase submission %" PRIu64 " %s: subqueue syncobjs %" PRIu64 " %" PRIu64
+                " %" PRIu64 ", errors %u %u %u",
+                seq, waited ? "done" : "TIMED OUT", so[0].seqno, so[1].seqno, so[2].seqno,
+                so[0].error, so[1].error, so[2].error);
+      if (PANVK_DEBUG(TRACE))
+         panvk_queue_kbase_decode(queue, vk_submit);
+      return panvk_per_arch(gpu_queue_check_status)(&queue->vk);
+   }
+
+   return VK_SUCCESS;
+}
+
 VkResult
 panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_submit *vk_submit)
 {
@@ -1354,8 +1690,14 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
       return panvk_queue_vm_bind(vk_queue, vk_submit, queue->syncobj_handle);
    }
 
+   struct panvk_gpu_queue *gpu_queue = container_of(vk_queue, struct panvk_gpu_queue, vk);
+   if (gpu_queue->kbase_group)
+      return panvk_queue_submit_kbase(gpu_queue, vk_submit);
+
    panvk_queue_submit_init(&submit, vk_queue);
-   panvk_queue_submit_init_storage(&submit, vk_submit, &stack_storage);
+   result = panvk_queue_submit_init_storage(&submit, vk_submit, &stack_storage);
+   if (result != VK_SUCCESS)
+      goto out;
    panvk_queue_submit_init_utrace(&submit, vk_submit);
    panvk_queue_submit_init_req_resource(&submit);
    panvk_queue_submit_init_waits(&submit, vk_submit);
@@ -1414,7 +1756,9 @@ panvk_per_arch(create_gpu_queue)(struct panvk_device *dev,
    if (result != VK_SUCCESS)
       goto err_free_queue;
 
-   int ret = drmSyncobjCreate(dev->drm_fd, 0, &queue->syncobj_handle);
+   int ret = pan_kmod_dev_is_kbase(dev->kmod.dev)
+                ? 0
+                : pan_kmod_sync_create(dev->kmod.dev, 0, &queue->syncobj_handle);
    if (ret) {
       result = panvk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
                             "Failed to create our internal sync object");
@@ -1449,7 +1793,8 @@ err_cleanup_tiler:
    cleanup_tiler(queue);
 
 err_destroy_syncobj:
-   drmSyncobjDestroy(dev->drm_fd, queue->syncobj_handle);
+   if (!pan_kmod_dev_is_kbase(dev->kmod.dev))
+      pan_kmod_sync_destroy(dev->kmod.dev, queue->syncobj_handle);
 
 err_finish_queue:
    vk_queue_finish(&queue->vk);
@@ -1468,7 +1813,8 @@ panvk_per_arch(destroy_gpu_queue)(struct vk_queue *vk_queue)
    cleanup_queue(queue);
    destroy_group(queue);
    cleanup_tiler(queue);
-   drmSyncobjDestroy(dev->drm_fd, queue->syncobj_handle);
+   if (!pan_kmod_dev_is_kbase(dev->kmod.dev))
+      pan_kmod_sync_destroy(dev->kmod.dev, queue->syncobj_handle);
    vk_queue_finish(&queue->vk);
    vk_free(&dev->vk.alloc, queue);
 }
@@ -1493,6 +1839,13 @@ panvk_per_arch(gpu_queue_check_status)(struct vk_queue *vk_queue)
             return vk_queue_set_lost(&queue->vk, "CS_FAULT");
          }
       }
+   }
+
+   if (queue->kbase_group) {
+      if (!queue->kbase_lost && !pan_kmod_kbase_csf_group_faulted(queue->kbase_group))
+         return VK_SUCCESS;
+      u_printf_with_ctx(stdout, &dev->printf.ctx);
+      return vk_queue_set_lost(&queue->vk, "kbase: the queue group faulted");
    }
 
    int ret = pan_kmod_ioctl(dev->drm_fd, DRM_IOCTL_PANTHOR_GROUP_GET_STATE,

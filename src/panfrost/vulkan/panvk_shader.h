@@ -109,6 +109,9 @@ struct panvk_common_sysvals_inner {
 
    /* Address of the printf buffer */
    aligned_u64 printf_buffer_address;
+
+   /* Address of the shader constant data buffer */
+   aligned_u64 constant_data;
 } __attribute__((aligned(FAU_WORD_SIZE)));
 
 struct panvk_common_sysvals {
@@ -156,6 +159,17 @@ struct panvk_graphics_sysvals {
       int32_t base_instance;
       uint32_t noperspective_varyings;
    } vs;
+
+#if PAN_ARCH == 9
+   /* Geometry shader emulation on v9: where the vertex shader run as compute writes its records,
+    * and where the rasterization pass reads the geometry shader's output vertices from. */
+   struct {
+      aligned_u64 pos;
+      aligned_u64 general;
+      uint32_t instance_stride;
+      uint32_t pad;
+   } gs_io;
+#endif
 
    struct {
       aligned_u64 blend_descs[MAX_RTS];
@@ -214,7 +228,9 @@ struct panvk_compute_sysvals {
    struct {
       aligned_u64 sets[PANVK_DESC_TABLE_COMPUTE_COUNT];
    } desc;
+#endif
 
+#if PAN_ARCH < 10
    /* Geometry shader emulation: a lowered geometry shader runs as compute and reads its buffer
     * addresses from here. Layout must match struct panvk_gs_push, which is what
     * panvk_nir_lower_gs.c addresses with offsetof(). */
@@ -222,7 +238,7 @@ struct panvk_compute_sysvals {
 #endif
 } __attribute__((aligned(FAU_WORD_SIZE)));
 
-#if PAN_ARCH < 9
+#if PAN_ARCH < 10
 static_assert((offsetof(struct panvk_compute_sysvals, gs) % FAU_WORD_SIZE) == 0,
               "panvk_compute_sysvals::gs must be 8-byte aligned");
 #endif
@@ -457,6 +473,15 @@ struct panvk_shader_variant {
       uint32_t tcs_nr_patch_outputs;
       uint32_t tcs_output_stride;
       uint64_t tcs_per_vertex_outputs;
+#if PAN_ARCH == 9
+      /* v9: the record layout between the emulation stages, one 16-byte slot per generic
+       * location. On a vertex shader compiled for a geometry shader: what it writes per vertex
+       * (vs_for_gs). On a geometry shader: its output vertices, which the rasterization
+       * variant reads. PANVK_GS_SLOT_UNUSED for a location that is not there. */
+      bool vs_for_gs;
+      uint32_t rec_offsets[64];
+      uint32_t rec_stride;
+#endif
    } gs;
 
    struct panvk_shader_fau_info fau;
@@ -464,6 +489,12 @@ struct panvk_shader_variant {
    const void *bin_ptr;
    uint32_t bin_size;
    bool own_bin;
+
+#if PAN_ARCH < 9
+   const void *data_ptr;
+   uint32_t data_size;
+   struct panvk_priv_mem data_mem;
+#endif
 
    struct panvk_priv_mem code_mem;
 
@@ -510,6 +541,13 @@ panvk_shader_num_variants(mesa_shader_stage stage)
    if (stage == MESA_SHADER_VERTEX)
       return PANVK_VS_VARIANTS;
 
+#if PAN_ARCH == 9
+   /* v9: the lowered geometry shader (compute) and the vertex shader that rasterizes its
+    * output (panvk_shader_gs_rast_variant). */
+   if (stage == MESA_SHADER_GEOMETRY)
+      return 2;
+#endif
+
    return 1;
 }
 
@@ -529,8 +567,6 @@ panvk_shader_variant_name(const struct panvk_shader *shader,
       return panvk_vs_shader_variant_name[i];
    }
 
-   assert(panvk_shader_num_variants(shader->vk.stage) == 1);
-
    return NULL;
 }
 
@@ -540,9 +576,18 @@ panvk_shader_only_variant(const struct panvk_shader *shader)
    if (!shader)
       return NULL;
 
-   assert(panvk_shader_num_variants(shader->vk.stage) == 1);
+   assert(panvk_shader_num_variants(shader->vk.stage) == 1 ||
+          shader->vk.stage == MESA_SHADER_GEOMETRY);
    return &shader->variants[0];
 }
+
+#if PAN_ARCH == 9
+static inline const struct panvk_shader_variant *
+panvk_shader_gs_rast_variant(const struct panvk_shader *shader)
+{
+   return shader ? &shader->variants[1] : NULL;
+}
+#endif
 
 static const struct panvk_shader_variant *
 panvk_shader_hw_variant(const struct panvk_shader *shader)

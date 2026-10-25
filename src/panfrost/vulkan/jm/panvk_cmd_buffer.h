@@ -83,6 +83,17 @@ struct panvk_cmd_event_op {
    struct panvk_event *event;
 };
 
+#if PAN_ARCH < 9
+/* How many draws a tiler job is added to the chain behind: see
+ * panvk_per_arch(cmd_flush_pending_tilers). */
+#define PANVK_TILER_LAG 2
+
+struct panvk_pending_tiler {
+   struct pan_ptr job;
+   unsigned dep;
+};
+#endif
+
 struct panvk_cmd_buffer {
    struct vk_command_buffer vk;
 
@@ -96,10 +107,41 @@ struct panvk_cmd_buffer {
    struct list_head push_sets;
    struct panvk_batch *cur_batch;
 
+   /* kbase: the stack every batch of this command buffer shares, the largest one asked for so
+    * far. kbase runs a device's atoms one after another, so no two batches use it at once. */
+   struct {
+      uint64_t ptr;
+      unsigned size;
+   } tls_stack;
+
    struct {
       struct panvk_cmd_graphics_state gfx;
       struct panvk_cmd_compute_state compute;
       struct panvk_push_constant_state push_constants;
+      bool uses_poly_heap;
+      /* The struct poly_heap the indirect draws of this command buffer take their varyings
+       * from, 0 until the first one. In the descriptor pool, not the device's: that one is
+       * GPU-uncached on kbase, and the draw helper allocates from it with atomics. */
+      uint64_t indirect_heap;
+#if PAN_ARCH < 9
+      /* Tiler jobs of the last draws, not in the chain yet. */
+      struct panvk_pending_tiler pending_tilers[PANVK_TILER_LAG];
+      unsigned pending_tiler_count;
+#endif
+#if PAN_ARCH == 9
+      /* What the last draw built, reused by the next one while the state it came from has not
+       * changed (jm/panvk_v9_cmd_draw.c). valid is cleared where that is not tracked. */
+      struct panvk_cmd_buffer_v9_cache {
+         bool valid;
+         const void *fs;
+         uint32_t base_instance;
+         uint64_t blend;
+         uint32_t blend_count;
+         uint64_t zsd;
+         uint64_t vs_fau;
+         uint64_t fs_fau;
+      } v9;
+#endif
    } state;
 };
 
@@ -148,6 +190,11 @@ struct panvk_batch *
 
 void panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf);
 
+#if PAN_ARCH < 9
+void panvk_per_arch(cmd_flush_pending_tilers)(struct panvk_cmd_buffer *cmdbuf,
+                                              unsigned keep);
+#endif
+
 void panvk_per_arch(cmd_finish_draw_helper)(struct panvk_cmd_buffer *cmdbuf,
                                             struct panvk_batch *batch);
 
@@ -164,5 +211,10 @@ void panvk_per_arch(cmd_bind_shaders)(struct vk_command_buffer *vk_cmd,
                                       uint32_t stage_count,
                                       const mesa_shader_stage *stages,
                                       struct vk_shader **const shaders);
+
+/* If a job was added to reset the heap, it's job id is returned in 'job_id'
+ * so that it can be used in dependencies */
+VkResult panvk_per_arch(cmd_init_poly_heap)(struct panvk_cmd_buffer *cmdbuf,
+                                            unsigned *job_id);
 
 #endif

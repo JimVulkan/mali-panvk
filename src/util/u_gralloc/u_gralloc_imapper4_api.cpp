@@ -1,6 +1,7 @@
 /*
  * Mesa 3-D graphics library
  *
+ * Copyright (C) 2026 NXP
  * Copyright (C) 2021 GlobalLogic Ukraine
  * Copyright (C) 2021-2022 Roman Stratiienko (r.stratiienko@gmail.com)
  * SPDX-License-Identifier: MIT
@@ -14,6 +15,9 @@
 #include <aidl/android/hardware/graphics/common/PlaneLayoutComponentType.h>
 #include <gralloctypes/Gralloc4.h>
 #include <system/window.h>
+
+#include <string.h>
+#include <unistd.h>
 
 #include "util/log.h"
 #include "u_gralloc_internal.h"
@@ -33,7 +37,7 @@ using android::hardware::graphics::mapper::V4_0::IMapper;
 using MetadataType =
    android::hardware::graphics::mapper::V4_0::IMapper::MetadataType;
 
-Error
+static Error
 GetMetadata(android::sp<IMapper> mapper, const native_handle_t *buffer,
             MetadataType type, hidl_vec<uint8_t> *metadata)
 {
@@ -54,7 +58,7 @@ GetMetadata(android::sp<IMapper> mapper, const native_handle_t *buffer,
    return error;
 }
 
-std::optional<std::vector<PlaneLayout>>
+static std::optional<std::vector<PlaneLayout>>
 GetPlaneLayouts(android::sp<IMapper> mapper, const native_handle_t *buffer)
 {
    hidl_vec<uint8_t> encoded_layouts;
@@ -80,14 +84,25 @@ GetPlaneLayouts(android::sp<IMapper> mapper, const native_handle_t *buffer)
 struct gralloc4 {
    struct u_gralloc base;
    android::sp<IMapper> mapper;
+   /* XCLIPSE: handles the mapper cannot describe go to the handle parsers instead. */
+   struct u_gralloc *fallback;
 };
 
 extern "C" {
 
+/* Whether fd is something with a size (a dma-buf), leaving its offset at 0. */
+static bool
+mapper4_fd_has_size(int fd)
+{
+   const off_t sz = lseek(fd, 0, SEEK_END);
+   lseek(fd, 0, SEEK_SET);
+   return sz > 0;
+}
+
 static int
-mapper4_get_buffer_basic_info(struct u_gralloc *gralloc,
-                              struct u_gralloc_buffer_handle *hnd,
-                              struct u_gralloc_buffer_basic_info *out)
+mapper4_query_buffer_basic_info(struct u_gralloc *gralloc,
+                                struct u_gralloc_buffer_handle *hnd,
+                                struct u_gralloc_buffer_basic_info *out)
 {
    gralloc4 *gr4 = (gralloc4 *)gralloc;
 
@@ -125,8 +140,38 @@ mapper4_get_buffer_basic_info(struct u_gralloc *gralloc,
    if (status != android::OK)
       return -EINVAL;
 
+   uint64_t alloc_size;
+
+   hidl_vec<uint8_t> encoded_alloc_size;
+   err = GetMetadata(gr4->mapper, hnd->handle,
+                     android::gralloc4::MetadataType_AllocationSize,
+                     &encoded_alloc_size);
+   if (err != Error::NONE)
+      return -EINVAL;
+
+   status = android::gralloc4::decodeAllocationSize(encoded_alloc_size,
+                                                    &alloc_size);
+   if (status != android::OK)
+      return -EINVAL;
+
+   uint64_t layer_count;
+
+   hidl_vec<uint8_t> encoded_layer_count;
+   err = GetMetadata(gr4->mapper, hnd->handle,
+                     android::gralloc4::MetadataType_LayerCount,
+                     &encoded_layer_count);
+   if (err != Error::NONE)
+      return -EINVAL;
+
+   status = android::gralloc4::decodeLayerCount(encoded_layer_count,
+                                                &layer_count);
+   if (status != android::OK)
+      return -EINVAL;
+
    out->drm_fourcc = drm_fourcc;
    out->modifier = drm_modifier;
+   out->alloc_size = alloc_size;
+   out->layer_count = layer_count;
 
    auto layouts_opt = GetPlaneLayouts(gr4->mapper, hnd->handle);
 
@@ -139,6 +184,27 @@ mapper4_get_buffer_basic_info(struct u_gralloc *gralloc,
 
    int fd_index = 0;
 
+   /* XCLIPSE: some gralloc4 implementations (Samsung's) leave strideInBytes at 0 on linear
+    * buffers while every other field is right. Rebuild it from the plane's width and component
+    * sizes, or from its total size when it is the only plane. */
+   for (uint32_t i = 0; i < layouts.size(); i++) {
+      if (layouts[i].strideInBytes != 0)
+         continue;
+
+      int64_t bits = 0;
+      for (const auto &comp : layouts[i].components)
+         bits += comp.sizeInBits;
+
+      int64_t stride = 0;
+      if (bits > 0 && bits % 8 == 0 && layouts[i].widthInSamples > 0)
+         stride = layouts[i].widthInSamples * (bits / 8);
+      else if (layouts.size() == 1 && layouts[i].heightInSamples > 0)
+         stride = layouts[i].totalSizeInBytes / layouts[i].heightInSamples;
+      if (stride <= 0)
+         return -EINVAL;
+      layouts[i].strideInBytes = stride;
+   }
+
    for (uint32_t i = 0; i < layouts.size(); i++) {
       out->strides[i] = layouts[i].strideInBytes;
       out->offsets[i] = layouts[i].offsetInBytes;
@@ -150,10 +216,33 @@ mapper4_get_buffer_basic_info(struct u_gralloc *gralloc,
       if (fd_index >= hnd->handle->numFds)
          return -EINVAL;
 
+      /* XCLIPSE: MediaTek's ARM gralloc puts a -1 fd ahead of the buffer's, or (Dimensity 9300,
+       * Android 15) an fd that is not a dma-buf at all: lseek gives it no size. Skip both. */
+      while (fd_index < hnd->handle->numFds &&
+             (hnd->handle->data[fd_index] < 0 || !mapper4_fd_has_size(hnd->handle->data[fd_index])))
+         fd_index++;
+      if (fd_index >= hnd->handle->numFds)
+         return -EINVAL;
+
       out->fds[i] = hnd->handle->data[fd_index];
    }
 
    return 0;
+}
+
+static int
+mapper4_get_buffer_basic_info(struct u_gralloc *gralloc,
+                              struct u_gralloc_buffer_handle *hnd,
+                              struct u_gralloc_buffer_basic_info *out)
+{
+   gralloc4 *gr4 = (gralloc4 *)gralloc;
+
+   int ret = mapper4_query_buffer_basic_info(gralloc, hnd, out);
+   if (ret == 0 || !gr4->fallback || !hnd->handle)
+      return ret;
+
+   memset(out, 0, sizeof(*out));
+   return gr4->fallback->ops.get_buffer_basic_info(gr4->fallback, hnd, out);
 }
 
 static int
@@ -277,6 +366,8 @@ static int
 destroy(struct u_gralloc *gralloc)
 {
    gralloc4 *gr = (struct gralloc4 *)gralloc;
+   if (gr->fallback)
+      gr->fallback->ops.destroy(gr->fallback);
    delete gr;
 
    return 0;
@@ -291,6 +382,7 @@ u_gralloc_imapper_api_create()
 
    auto gr = new gralloc4;
    gr->mapper = mapper;
+   gr->fallback = u_gralloc_fallback_create();
    gr->base.ops.get_buffer_basic_info = mapper4_get_buffer_basic_info;
    gr->base.ops.get_buffer_color_info = mapper4_get_buffer_color_info;
    gr->base.ops.get_front_rendering_usage = mapper4_get_front_rendering_usage;

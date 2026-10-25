@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "kmod/kbase_kmod.h"
+#include "panvk_bc_emu.h"
 #include "panvk_buffer.h"
 #include "panvk_cmd_meta.h"
 #include "panvk_entrypoints.h"
@@ -32,6 +34,47 @@ copy_to_image_use_gfx_pipeline(struct panvk_image *dst_img)
 
    return false;
 }
+
+#if PAN_ARCH >= 10
+/* Compute copies bypass framebuffer CRC tracking, so writes touching the
+ * mip-0 CRC region must invalidate its state explicitly.
+ */
+static bool
+copy_buffer_to_image_touches_crc(const struct panvk_image *dst_img,
+                                 const VkCopyDeviceMemoryImageInfoKHR *info)
+{
+   if (!panvk_image_plane_crc_header_addr(dst_img))
+      return false;
+
+   for (uint32_t i = 0; i < info->regionCount; i++) {
+      const VkImageSubresourceLayers *dst = &info->pRegions[i].imageSubresource;
+
+      if (dst->mipLevel == 0 &&
+          panvk_plane_index(dst_img, dst->aspectMask) == 0)
+         return true;
+   }
+
+   return false;
+}
+
+static bool
+copy_image_touches_crc(const struct panvk_image *dst_img,
+                       const VkCopyImageInfo2 *info)
+{
+   if (!panvk_image_plane_crc_header_addr(dst_img))
+      return false;
+
+   for (uint32_t i = 0; i < info->regionCount; i++) {
+      const VkImageSubresourceLayers *dst = &info->pRegions[i].dstSubresource;
+
+      if (dst->mipLevel == 0 &&
+          panvk_plane_index(dst_img, dst->aspectMask) == 0)
+         return true;
+   }
+
+   return false;
+}
+#endif /* PAN_ARCH >= 10 */
 
 static void
 meta_compute_start(struct panvk_cmd_buffer *cmdbuf,
@@ -205,7 +248,6 @@ meta_gfx_end(struct panvk_cmd_buffer *cmdbuf,
    cmdbuf->state.gfx.vs.attrib_bufs = 0;
    cmdbuf->state.gfx.vs.indirect_attribs_infos = 0;
    cmdbuf->state.gfx.vs.indirect_attrib_bufs_infos = 0;
-   cmdbuf->state.gfx.vs.indirect_varying_bufs_infos = 0;
    cmdbuf->state.gfx.fs.rsd = 0;
 #else
    cmdbuf->state.gfx.fs.desc.res_table = 0;
@@ -345,24 +387,24 @@ panvk_per_arch(CmdClearColorImage)(VkCommandBuffer commandBuffer, VkImage image,
 }
 
 VKAPI_ATTR void VKAPI_CALL
-panvk_per_arch(CmdCopyBuffer2)(VkCommandBuffer commandBuffer,
-                               const VkCopyBufferInfo2 *pCopyBufferInfo)
+panvk_per_arch(CmdCopyMemoryKHR)(VkCommandBuffer commandBuffer,
+                                 const VkCopyDeviceMemoryInfoKHR* pCopyMemoryInfo)
 {
    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
    struct panvk_cmd_meta_compute_save_ctx save = {0};
 
    meta_compute_start(cmdbuf, &save);
-   vk_meta_copy_buffer(&cmdbuf->vk, &dev->meta, pCopyBufferInfo);
+   vk_meta_copy_memory(&cmdbuf->vk, &dev->meta, pCopyMemoryInfo);
    meta_compute_end(cmdbuf, &save);
 }
 
 static bool
-lower_copy_buffer_to_image(
+lower_copy_memory_to_image(
    VkCommandBuffer commandBuffer,
-   const VkCopyBufferToImageInfo2 *pCopyBufferToImageInfo)
+   const VkCopyDeviceMemoryImageInfoKHR* pCopyMemoryInfo)
 {
-   VK_FROM_HANDLE(panvk_image, dst_img, pCopyBufferToImageInfo->dstImage);
+   VK_FROM_HANDLE(panvk_image, dst_img, pCopyMemoryInfo->image);
 
    const VkImageAspectFlags zs_mask =
       (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
@@ -372,9 +414,9 @@ lower_copy_buffer_to_image(
       return false;
 
    uint32_t num_depth_regions = 0, num_stencil_regions = 0;
-   for (uint32_t i = 0; i < pCopyBufferToImageInfo->regionCount; i++) {
+   for (uint32_t i = 0; i < pCopyMemoryInfo->regionCount; i++) {
       const VkImageAspectFlags aspect_mask =
-         pCopyBufferToImageInfo->pRegions[i].imageSubresource.aspectMask;
+         pCopyMemoryInfo->pRegions[i].imageSubresource.aspectMask;
       assert((aspect_mask & ~zs_mask) == 0);
       if (aspect_mask & VK_IMAGE_ASPECT_DEPTH_BIT)
          num_depth_regions++;
@@ -389,24 +431,24 @@ lower_copy_buffer_to_image(
    if (!lowering_needed)
       return false;
 
-   VkCopyBufferToImageInfo2 adjusted_info = *pCopyBufferToImageInfo;
-   STACK_ARRAY(VkBufferImageCopy2, depth_regions, num_depth_regions);
-   STACK_ARRAY(VkBufferImageCopy2, stencil_regions, num_stencil_regions);
+   VkCopyDeviceMemoryImageInfoKHR adjusted_info = *pCopyMemoryInfo;
+   STACK_ARRAY(VkDeviceMemoryImageCopyKHR, depth_regions, num_depth_regions);
+   STACK_ARRAY(VkDeviceMemoryImageCopyKHR, stencil_regions, num_stencil_regions);
 
    uint32_t depth_idx = 0, stencil_idx = 0;
-   for (uint32_t i = 0; i < pCopyBufferToImageInfo->regionCount; i++) {
+   for (uint32_t i = 0; i < pCopyMemoryInfo->regionCount; i++) {
       const VkImageAspectFlags aspect_mask =
-         pCopyBufferToImageInfo->pRegions[i].imageSubresource.aspectMask;
+         pCopyMemoryInfo->pRegions[i].imageSubresource.aspectMask;
 
       if (aspect_mask & VK_IMAGE_ASPECT_DEPTH_BIT)
-         depth_regions[depth_idx++] = pCopyBufferToImageInfo->pRegions[i];
+         depth_regions[depth_idx++] = pCopyMemoryInfo->pRegions[i];
       else
-         stencil_regions[stencil_idx++] = pCopyBufferToImageInfo->pRegions[i];
+         stencil_regions[stencil_idx++] = pCopyMemoryInfo->pRegions[i];
    }
 
    adjusted_info.regionCount = num_depth_regions;
    adjusted_info.pRegions = depth_regions;
-   panvk_per_arch(CmdCopyBufferToImage2)(commandBuffer, &adjusted_info);
+   panvk_per_arch(CmdCopyMemoryToImageKHR)(commandBuffer, &adjusted_info);
 
    const VkMemoryBarrier2 mem_barrier = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
@@ -423,7 +465,7 @@ lower_copy_buffer_to_image(
 
    adjusted_info.regionCount = num_stencil_regions;
    adjusted_info.pRegions = stencil_regions;
-   panvk_per_arch(CmdCopyBufferToImage2)(commandBuffer, &adjusted_info);
+   panvk_per_arch(CmdCopyMemoryToImageKHR)(commandBuffer, &adjusted_info);
 
    STACK_ARRAY_FINISH(depth_regions);
    STACK_ARRAY_FINISH(stencil_regions);
@@ -431,17 +473,266 @@ lower_copy_buffer_to_image(
    return true;
 }
 
+/* BC4-BC7 emulation (panvk_bc_emu.h): after a copy into an emulated image, re-run the
+ * transcoder over each copied region so the hidden plane 1 matches the blocks in plane 0. */
+struct bc_emu_region {
+   VkImageSubresourceLayers sub;
+   VkOffset3D offset;
+   VkExtent3D extent;
+};
+
+static void
+bc_emu_barrier(struct panvk_cmd_buffer *cmdbuf)
+{
+   const VkMemoryBarrier2 barrier = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+      .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+      .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+      .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+      .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+   };
+   const VkDependencyInfo dep = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .memoryBarrierCount = 1,
+      .pMemoryBarriers = &barrier,
+   };
+   panvk_per_arch(CmdPipelineBarrier2)(panvk_cmd_buffer_to_handle(cmdbuf), &dep);
+}
+
+static void
+bc_emu_transcode(struct panvk_cmd_buffer *cmdbuf, struct panvk_image *img,
+                 const struct bc_emu_region *regions, uint32_t region_count)
+{
+   struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+   const struct vk_device_dispatch_table *disp = &dev->vk.dispatch_table;
+   VkCommandBuffer cmd = panvk_cmd_buffer_to_handle(cmdbuf);
+   const VkFormat format = img->vk.format;
+   VkPipeline pipeline;
+   VkPipelineLayout layout;
+   VkBuffer buffer;
+
+   /* A 3D image goes through the 3D variant: its depth slices take the place of layers. */
+   const bool is_3d = img->vk.image_type == VK_IMAGE_TYPE_3D;
+   VkResult result = panvk_bc_emu_get_pipeline(dev, format, is_3d, &pipeline, &layout);
+   if (result == VK_SUCCESS)
+      result = panvk_bc_emu_get_buffer(dev, &buffer);
+   if (result != VK_SUCCESS) {
+      vk_command_buffer_set_error(&cmdbuf->vk, result);
+      return;
+   }
+
+   /* The copy's writes, whichever pipeline made them, before the transcoder reads plane 0. */
+   bc_emu_barrier(cmdbuf);
+
+   struct panvk_cmd_meta_compute_save_ctx save = {0};
+   meta_compute_start(cmdbuf, &save);
+   disp->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+
+   for (uint32_t i = 0; i < region_count; i++) {
+      const struct bc_emu_region *r = &regions[i];
+      const VkExtent3D mip = vk_image_mip_level_extent(&img->vk, r->sub.mipLevel);
+      const uint32_t x0 = r->offset.x & ~3u, y0 = r->offset.y & ~3u;
+      const uint32_t x1 = MIN2((uint32_t)r->offset.x + r->extent.width, mip.width);
+      const uint32_t y1 = MIN2((uint32_t)r->offset.y + r->extent.height, mip.height);
+      uint32_t layers = vk_image_subresource_layer_count(&img->vk, &r->sub), z0 = 0;
+      if (is_3d) {
+         z0 = MAX2(r->offset.z, 0);
+         const uint32_t z1 = MIN2(z0 + r->extent.depth, mip.depth);
+         layers = z1 > z0 ? z1 - z0 : 0;
+      }
+      if (x1 <= x0 || y1 <= y0 || !layers)
+         continue;
+
+      const VkImageViewUsageCreateInfo load_usage = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+         .usage = VK_IMAGE_USAGE_SAMPLED_BIT,
+      };
+      VkImageViewCreateInfo vi = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+         .pNext = &load_usage,
+         .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
+         .image = panvk_image_to_handle(img),
+         .viewType = is_3d ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+         .format = panvk_bc_emu_load_format(format),
+         .subresourceRange =
+            {
+               .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+               .baseMipLevel = r->sub.mipLevel,
+               .levelCount = 1,
+               .baseArrayLayer = is_3d ? 0 : r->sub.baseArrayLayer,
+               .layerCount = is_3d ? 1 : layers,
+            },
+      };
+      VkImageView load_view, store_view;
+      result = vk_meta_create_image_view(&cmdbuf->vk, &dev->meta, &vi, &load_view);
+      if (result != VK_SUCCESS)
+         break;
+
+      const VkImageViewUsageCreateInfo store_usage = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+         .usage = VK_IMAGE_USAGE_STORAGE_BIT,
+      };
+      vi.pNext = &store_usage;
+      vi.format = panvk_bc_emu_store_format(to_panvk_physical_device(dev->vk.physical), format);
+      vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_PLANE_1_BIT;
+      result = vk_meta_create_image_view(&cmdbuf->vk, &dev->meta, &vi, &store_view);
+      if (result != VK_SUCCESS)
+         break;
+
+      const VkDescriptorImageInfo load_info = {
+         .imageView = load_view,
+         .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+      };
+      const VkDescriptorImageInfo store_info = {
+         .imageView = store_view,
+         .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+      };
+      const VkDescriptorBufferInfo stats_info = {buffer, 0, PANVK_BC_EMU_STATS_SIZE};
+      const VkDescriptorBufferInfo lut_info = {buffer, PANVK_BC_EMU_STATS_SIZE,
+                                               PANVK_BC_EMU_LUT_SIZE};
+      const VkDescriptorBufferInfo tables_info = {buffer, PANVK_BC_EMU_TABLES_OFFSET,
+                                                  PANVK_BC_EMU_TABLES_SIZE};
+      const VkWriteDescriptorSet writes[] = {
+         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0,
+          .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+          .pImageInfo = &load_info},
+         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 1,
+          .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+          .pImageInfo = &store_info},
+         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 2,
+          .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+          .pBufferInfo = &stats_info},
+         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 3,
+          .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+          .pBufferInfo = &lut_info},
+         {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 4,
+          .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+          .pBufferInfo = &tables_info},
+      };
+      disp->CmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0,
+                                    ARRAY_SIZE(writes), writes);
+
+      /* bc_decoder.glsl's push constants: the block-aligned region offset (a 2D array view
+       * starts at the region's first layer, so z is 0; a 3D view is the whole mip level, so z is
+       * the first slice), the format, an unused image type, the region size in texels, and -1 for
+       * the content census RADV keeps. */
+      const int32_t pc[8] = {(int32_t)x0, (int32_t)y0, (int32_t)z0,
+                             panvk_bc_emu_shader_format(format), 0,
+                             (int32_t)(x1 - x0), (int32_t)(y1 - y0), -1};
+      disp->CmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+      disp->CmdDispatch(cmd, DIV_ROUND_UP(DIV_ROUND_UP(x1 - x0, 4), 8),
+                        DIV_ROUND_UP(DIV_ROUND_UP(y1 - y0, 4), 8), layers);
+   }
+
+   meta_compute_end(cmdbuf, &save);
+   if (result != VK_SUCCESS)
+      vk_command_buffer_set_error(&cmdbuf->vk, result);
+
+   /* The new plane 1 before anything samples it. */
+   bc_emu_barrier(cmdbuf);
+}
+
+#if PAN_ARCH < 10
+/* Every mip level, layer and slice of a linear image, from what its plane 0 holds now. */
+static void
+bc_emu_refresh_image(struct panvk_cmd_buffer *cmdbuf, struct panvk_image *img)
+{
+   const uint32_t levels = img->vk.mip_levels;
+   STACK_ARRAY(struct bc_emu_region, regions, levels);
+   for (uint32_t l = 0; l < levels; l++) {
+      regions[l] = (struct bc_emu_region){
+         .sub = {VK_IMAGE_ASPECT_COLOR_BIT, l, 0, img->vk.array_layers},
+         .offset = {0, 0, 0},
+         .extent = vk_image_mip_level_extent(&img->vk, l),
+      };
+   }
+   bc_emu_transcode(cmdbuf, img, regions, levels);
+   STACK_ARRAY_FINISH(regions);
+}
+
+struct panvk_cmd_buffer *
+panvk_per_arch(bc_emu_refresh_begin)(struct panvk_device *dev)
+{
+   struct panvk_bc_emu_state *st = &dev->bc_emu;
+   const struct vk_device_dispatch_table *disp = &dev->vk.dispatch_table;
+   VkDevice h = panvk_device_to_handle(dev);
+
+   simple_mtx_lock(&st->linear_lock);
+   if (list_is_empty(&st->linear_images))
+      goto none;
+
+   if (st->refresh_pool == VK_NULL_HANDLE) {
+      const VkCommandPoolCreateInfo pci = {
+         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+      };
+      const VkCommandBufferAllocateInfo cai = {
+         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+         .commandBufferCount = ARRAY_SIZE(st->refresh),
+      };
+      if (disp->CreateCommandPool(h, &pci, NULL, &st->refresh_pool) != VK_SUCCESS)
+         goto none;
+      VkCommandBufferAllocateInfo ai = cai;
+      ai.commandPool = st->refresh_pool;
+      if (disp->AllocateCommandBuffers(h, &ai, st->refresh) != VK_SUCCESS) {
+         disp->DestroyCommandPool(h, st->refresh_pool, NULL);
+         st->refresh_pool = VK_NULL_HANDLE;
+         goto none;
+      }
+   }
+
+   VkCommandBuffer cmd = st->refresh[st->refresh_next];
+   st->refresh_next = (st->refresh_next + 1) % ARRAY_SIZE(st->refresh);
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, cmd);
+
+   /* The ring slot's last run, four submissions ago, before it is reset. */
+   if (cmdbuf->kbase_seq)
+      pan_kmod_kbase_wait_seq(dev->kmod.dev, cmdbuf->kbase_seq);
+   disp->ResetCommandBuffer(cmd, 0);
+   const VkCommandBufferBeginInfo bi = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+   };
+   disp->BeginCommandBuffer(cmd, &bi);
+   list_for_each_entry(struct panvk_image, img, &st->linear_images, bc_emu.link)
+      bc_emu_refresh_image(cmdbuf, img);
+   if (disp->EndCommandBuffer(cmd) != VK_SUCCESS)
+      goto none;
+
+   return cmdbuf;
+
+none:
+   simple_mtx_unlock(&st->linear_lock);
+   return NULL;
+}
+
+void
+panvk_per_arch(bc_emu_refresh_end)(struct panvk_device *dev, struct panvk_cmd_buffer *cmdbuf,
+                                   uint64_t seq)
+{
+   struct panvk_bc_emu_state *st = &dev->bc_emu;
+
+   if (seq) {
+      cmdbuf->kbase_seq = seq;
+      list_for_each_entry(struct panvk_image, img, &st->linear_images, bc_emu.link)
+         img->bc_emu.seq = seq;
+   }
+   simple_mtx_unlock(&st->linear_lock);
+}
+#endif
+
 VKAPI_ATTR void VKAPI_CALL
-panvk_per_arch(CmdCopyBufferToImage2)(
+panvk_per_arch(CmdCopyMemoryToImageKHR)(
    VkCommandBuffer commandBuffer,
-   const VkCopyBufferToImageInfo2 *pCopyBufferToImageInfo)
+   const VkCopyDeviceMemoryImageInfoKHR* pCopyMemoryInfo)
 {
    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
-   VK_FROM_HANDLE(panvk_image, img, pCopyBufferToImageInfo->dstImage);
+   VK_FROM_HANDLE(panvk_image, img, pCopyMemoryInfo->image);
 
    /* Early out if this operation was lowered. */
-   if (lower_copy_buffer_to_image(commandBuffer, pCopyBufferToImageInfo))
+   if (lower_copy_memory_to_image(commandBuffer, pCopyMemoryInfo))
       return;
 
    const bool use_gfx_pipeline = copy_to_image_use_gfx_pipeline(img);
@@ -452,35 +743,56 @@ panvk_per_arch(CmdCopyBufferToImage2)(
       struct panvk_cmd_meta_graphics_save_ctx save = {0};
 
       meta_gfx_start(cmdbuf, &save);
-      vk_meta_copy_buffer_to_image(&cmdbuf->vk, &dev->meta,
-                                   pCopyBufferToImageInfo, &img_props,
+      vk_meta_copy_memory_to_image(&cmdbuf->vk, &dev->meta,
+                                   pCopyMemoryInfo, &img_props,
                                    VK_PIPELINE_BIND_POINT_GRAPHICS);
       meta_gfx_end(cmdbuf, &save);
    } else {
       struct panvk_cmd_meta_compute_save_ctx save = {0};
 
       meta_compute_start(cmdbuf, &save);
-      vk_meta_copy_buffer_to_image(&cmdbuf->vk, &dev->meta,
-                                   pCopyBufferToImageInfo, &img_props,
+#if PAN_ARCH >= 10
+      if (copy_buffer_to_image_touches_crc(img, pCopyMemoryInfo)) {
+         struct cs_builder *b =
+            panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_COMPUTE);
+
+         panvk_per_arch(cmd_invalidate_crc)(
+            b, panvk_image_plane_crc_header_addr(img));
+      }
+#endif
+      vk_meta_copy_memory_to_image(&cmdbuf->vk, &dev->meta,
+                                   pCopyMemoryInfo, &img_props,
                                    VK_PIPELINE_BIND_POINT_COMPUTE);
       meta_compute_end(cmdbuf, &save);
+   }
+
+   if (panvk_bc_emu_format(to_panvk_physical_device(dev->vk.physical), img->vk.format)) {
+      const uint32_t n = pCopyMemoryInfo->regionCount;
+      STACK_ARRAY(struct bc_emu_region, regions, n);
+      for (uint32_t i = 0; i < n; i++) {
+         const VkDeviceMemoryImageCopyKHR *r = &pCopyMemoryInfo->pRegions[i];
+         regions[i] = (struct bc_emu_region){r->imageSubresource, r->imageOffset,
+                                             r->imageExtent};
+      }
+      bc_emu_transcode(cmdbuf, img, regions, n);
+      STACK_ARRAY_FINISH(regions);
    }
 }
 
 VKAPI_ATTR void VKAPI_CALL
-panvk_per_arch(CmdCopyImageToBuffer2)(
+panvk_per_arch(CmdCopyImageToMemoryKHR)(
    VkCommandBuffer commandBuffer,
-   const VkCopyImageToBufferInfo2 *pCopyImageToBufferInfo)
+   const VkCopyDeviceMemoryImageInfoKHR* pCopyMemoryInfo)
 {
    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
-   VK_FROM_HANDLE(panvk_image, img, pCopyImageToBufferInfo->srcImage);
+   VK_FROM_HANDLE(panvk_image, img, pCopyMemoryInfo->image);
    struct vk_meta_copy_image_properties img_props =
       panvk_meta_copy_get_image_properties(img, false, false);
    struct panvk_cmd_meta_compute_save_ctx save = {0};
 
    meta_compute_start(cmdbuf, &save);
-   vk_meta_copy_image_to_buffer(&cmdbuf->vk, &dev->meta, pCopyImageToBufferInfo,
+   vk_meta_copy_image_to_memory(&cmdbuf->vk, &dev->meta, pCopyMemoryInfo,
                                 &img_props);
    meta_compute_end(cmdbuf, &save);
 }
@@ -655,10 +967,35 @@ panvk_per_arch(CmdCopyImage2)(VkCommandBuffer commandBuffer,
       struct panvk_cmd_meta_compute_save_ctx save = {0};
 
       meta_compute_start(cmdbuf, &save);
+#if PAN_ARCH >= 10
+      if (copy_image_touches_crc(dst_img, pCopyImageInfo)) {
+         struct cs_builder *b =
+            panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_COMPUTE);
+
+         panvk_per_arch(cmd_invalidate_crc)(
+            b, panvk_image_plane_crc_header_addr(dst_img));
+      }
+#endif
       vk_meta_copy_image(&cmdbuf->vk, &dev->meta, pCopyImageInfo,
                          &src_img_props, &dst_img_props,
                          VK_PIPELINE_BIND_POINT_COMPUTE);
       meta_compute_end(cmdbuf, &save);
+   }
+
+   if (panvk_bc_emu_format(to_panvk_physical_device(dev->vk.physical), dst_img->vk.format)) {
+      /* The extent is in source texels: scale it when the source is not block-compressed. */
+      const uint32_t sbw = vk_format_get_blockwidth(src_img->vk.format);
+      const uint32_t sbh = vk_format_get_blockheight(src_img->vk.format);
+      const uint32_t n = pCopyImageInfo->regionCount;
+      STACK_ARRAY(struct bc_emu_region, regions, n);
+      for (uint32_t i = 0; i < n; i++) {
+         const VkImageCopy2 *r = &pCopyImageInfo->pRegions[i];
+         regions[i] = (struct bc_emu_region){
+            r->dstSubresource, r->dstOffset,
+            {r->extent.width * 4 / sbw, r->extent.height * 4 / sbh, r->extent.depth}};
+      }
+      bc_emu_transcode(cmdbuf, dst_img, regions, n);
+      STACK_ARRAY_FINISH(regions);
    }
 }
 
@@ -672,6 +1009,7 @@ panvk_per_arch(cmd_meta_resolve_attachments)(struct panvk_cmd_buffer *cmdbuf)
    unsigned color_att_count =
       util_last_bit(bound_atts & MESA_VK_RP_ATTACHMENT_ANY_COLOR_BITS);
    VkRenderingAttachmentInfo color_atts[MAX_RTS];
+   VkRenderingAttachmentFlagsInfoKHR color_att_flags[MAX_RTS];
    for (uint32_t i = 0; i < color_att_count; i++) {
 
       const struct panvk_resolve_attachment *resolve_info =
@@ -679,8 +1017,14 @@ panvk_per_arch(cmd_meta_resolve_attachments)(struct panvk_cmd_buffer *cmdbuf)
       struct panvk_image_view *src_iview =
          cmdbuf->state.gfx.render.color_attachments.iviews[i];
 
+      color_att_flags[i] = (VkRenderingAttachmentFlagsInfoKHR){
+         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_FLAGS_INFO_KHR,
+         .flags = resolve_info->flags,
+      };
+
       color_atts[i] = (VkRenderingAttachmentInfo){
          .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+         .pNext = &color_att_flags[i],
          .imageView = panvk_image_view_to_handle(src_iview),
          .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
          .resolveMode = resolve_info->mode,

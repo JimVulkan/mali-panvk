@@ -26,11 +26,13 @@
 #include "panvk_physical_device.h"
 #include "panvk_priv_bo.h"
 
+#include "kmod/kbase_kmod.h"
 #include "pan_desc.h"
 #include "pan_encoder.h"
 #include "pan_props.h"
 #include "pan_samples.h"
 
+#include "poly/geometry.h"
 #include "vk_descriptor_update_template.h"
 #include "vk_format.h"
 
@@ -65,6 +67,36 @@ panvk_cmd_prepare_fragment_job(struct panvk_cmd_buffer *cmdbuf, uint64_t fbd)
    return VK_SUCCESS;
 }
 
+#if PAN_ARCH < 9
+/*
+ * A draw's tiler job joins the chain after the vertex jobs of the next PANVK_TILER_LAG draws:
+ * V0 V1 T0 V2 T1 ... instead of V0 T0 V1 T1 .... The job manager starts the jobs of a chain in
+ * order, and a tiler job waits for its vertex job, so in the plain order the GPU ran one job at
+ * a time; this way a vertex job runs while the previous draw tiles. 2000 small draws on Mali-G76
+ * went from 7.3 to 3.9 ms a frame (the vendor driver: 2.8-3.4). The tiler jobs stay in draw
+ * order, which is what orders the draws (probe/mali/bench BENCH_ORDER hashes the same, and as
+ * the vendor's). Anything else added to the chain flushes them first; keep is how many may
+ * stay pending.
+ */
+void
+panvk_per_arch(cmd_flush_pending_tilers)(struct panvk_cmd_buffer *cmdbuf, unsigned keep)
+{
+   const unsigned n = cmdbuf->state.pending_tiler_count;
+   if (n <= keep)
+      return;
+
+   const unsigned flush = n - keep;
+   for (unsigned i = 0; i < flush; i++) {
+      struct panvk_pending_tiler *t = &cmdbuf->state.pending_tilers[i];
+      pan_jc_add_job(&cmdbuf->cur_batch->vtc_jc, MALI_JOB_TYPE_TILER, false, false, t->dep, 0,
+                     &t->job, false);
+   }
+   memmove(&cmdbuf->state.pending_tilers[0], &cmdbuf->state.pending_tilers[flush],
+           keep * sizeof(cmdbuf->state.pending_tilers[0]));
+   cmdbuf->state.pending_tiler_count = keep;
+}
+#endif
+
 void
 panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
 {
@@ -74,6 +106,10 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
       return;
 
    assert(batch);
+
+#if PAN_ARCH < 9
+   panvk_per_arch(cmd_flush_pending_tilers)(cmdbuf, 0);
+#endif
 
    panvk_per_arch(cmd_finish_draw_helper)(cmdbuf, batch);
 
@@ -97,7 +133,9 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
          list_addtail(&batch->node, &cmdbuf->batches);
       }
       cmdbuf->cur_batch = NULL;
+#if PAN_ARCH < 10
       cmdbuf->state.gfx.xfb.last_job = 0;
+#endif
       return;
    }
 
@@ -115,8 +153,23 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
 
       unsigned size = pan_get_total_stack_size(batch->tlsinfo.tls.size,
                                                thread_tls_alloc, core_id_range);
-      batch->tlsinfo.tls.ptr =
-         panvk_cmd_alloc_dev_mem(cmdbuf, tls, size, 4096).gpu;
+
+      /* A stack per batch is a stack per vkCmdDispatch, and the stack is sized for every thread
+       * slot of every core ID: 768 x 23 on the Exynos 9820's G76, so 16 KB per thread made a
+       * 289 MB stack per dispatch and a few dozen dispatches ran the phone out of memory. On
+       * kbase the batches run in order, so they share one. The DRM path can overlap one
+       * batch's fragment job with the next batch's vertex jobs, so it keeps a stack each. */
+      if (pan_kmod_dev_is_kbase(phys_dev->kmod.dev)) {
+         if (size > cmdbuf->tls_stack.size) {
+            cmdbuf->tls_stack.ptr =
+               panvk_cmd_alloc_dev_mem(cmdbuf, tls, size, 4096).gpu;
+            cmdbuf->tls_stack.size = cmdbuf->tls_stack.ptr ? size : 0;
+         }
+         batch->tlsinfo.tls.ptr = cmdbuf->tls_stack.ptr;
+      } else {
+         batch->tlsinfo.tls.ptr =
+            panvk_cmd_alloc_dev_mem(cmdbuf, tls, size, 4096).gpu;
+      }
    }
 
    if (batch->tlsinfo.wls.size) {
@@ -183,7 +236,11 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
 
          fbd_info.layer = layer_id;
          fbd_info.frame_shaders = fs;
+#if PAN_ARCH < 9
+         /* Valhall's frame shaders are shared by every layer. */
          fbd_info.frame_shaders.dcd_pointer += layer_id * 3 * pan_size(DRAW);
+#endif
+
 
          const struct pan_fb_descs fb_descs = {
             .fbd = fbd.cpu,
@@ -204,9 +261,12 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
    }
 
    cmdbuf->cur_batch = NULL;
+#if PAN_ARCH < 10
    /* Job indices belong to a batch's chain. */
    cmdbuf->state.gfx.xfb.last_job = 0;
+#endif
 }
+
 
 VkResult
 panvk_per_arch(cmd_alloc_fb_desc)(struct panvk_cmd_buffer *cmdbuf)
@@ -297,7 +357,13 @@ panvk_per_arch(cmd_prepare_tiler_context)(struct panvk_cmd_buffer *cmdbuf,
       cfg.fb_height = fb->height_px;
       cfg.heap = batch->tiler.heap_desc.gpu;
       cfg.sample_pattern = pan_sample_pattern(fb->sample_count);
+#if PAN_ARCH == 9
+      /* v9 takes the provoking vertex from the tiler context, as Panfrost does. */
+      cfg.first_provoking_vertex =
+         cmdbuf->state.gfx.render.first_provoking_vertex != U_TRISTATE_NO;
+#endif
    }
+
 
    memcpy(batch->tiler.heap_desc.cpu, &batch->tiler.heap_templ,
           sizeof(batch->tiler.heap_templ));
@@ -332,6 +398,43 @@ panvk_per_arch(cmd_open_batch)(struct panvk_cmd_buffer *cmdbuf)
    cmdbuf->cur_batch->event_ops = UTIL_DYNARRAY_INIT;
    assert(cmdbuf->cur_batch);
    return cmdbuf->cur_batch;
+}
+
+VkResult
+panvk_per_arch(cmd_init_poly_heap)(struct panvk_cmd_buffer *cmdbuf,
+                                   unsigned *job_id)
+{
+   struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+   struct panvk_batch *batch = cmdbuf->cur_batch;
+
+   /* The first time poly_heap is used in a primary command buffer, we need to
+    * reset the heap bottom position. */
+   if (cmdbuf->state.uses_poly_heap ||
+       cmdbuf->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY) {
+      *job_id = 0;
+      return VK_SUCCESS;
+   }
+
+   struct pan_ptr job =
+      pan_pool_alloc_desc(&cmdbuf->desc_pool.base, WRITE_VALUE_JOB);
+   if (!job.gpu)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+   pan_section_pack(job.cpu, WRITE_VALUE_JOB, PAYLOAD, payload) {
+      payload.type = MALI_WRITE_VALUE_TYPE_IMMEDIATE_32;
+      payload.address = panvk_priv_mem_dev_addr(dev->poly_heap.state) +
+         offsetof(struct poly_heap, bottom);
+      payload.immediate_value = 0;
+   }
+
+   *job_id =
+      pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_WRITE_VALUE, false, false,
+                     0, 0, &job, false);
+   util_dynarray_append(&batch->jobs, job.cpu);
+
+   cmdbuf->state.uses_poly_heap = true;
+
+   return VK_SUCCESS;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -386,6 +489,7 @@ panvk_reset_cmdbuf(struct vk_command_buffer *vk_cmdbuf,
    panvk_pool_reset(&cmdbuf->varying_pool);
    panvk_cmd_buffer_obj_list_reset(cmdbuf, push_sets);
 
+   memset(&cmdbuf->tls_stack, 0, sizeof(cmdbuf->tls_stack));
    memset(&cmdbuf->state, 0, sizeof(cmdbuf->state));
 }
 

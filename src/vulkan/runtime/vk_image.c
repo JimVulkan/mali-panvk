@@ -76,6 +76,12 @@ vk_image_init(struct vk_device *device,
    image->usage = vk_image_usage_flags(pCreateInfo);
    image->sharing_mode = pCreateInfo->sharingMode;
 
+   /* Since VK_KHR_maintenance11, it's possible to create a concurrent image
+    * with only one queue family and this image can be considered exclusive.
+    */
+   if (pCreateInfo->queueFamilyIndexCount == 1)
+      image->sharing_mode = VK_SHARING_MODE_EXCLUSIVE;
+
    if (image->aspects & VK_IMAGE_ASPECT_STENCIL_BIT) {
       const VkImageStencilUsage2CreateInfoKHR *stencil_usage2_info =
          vk_find_struct_const(pCreateInfo->pNext,
@@ -129,19 +135,18 @@ vk_image_init(struct vk_device *device,
       image->android_buffer_type = ANDROID_BUFFER_NATIVE_ALIAS;
    }
 
-   const VkExternalFormatANDROID *ext_format =
-      vk_find_struct_const(pCreateInfo->pNext, EXTERNAL_FORMAT_ANDROID);
-   if (ext_format && ext_format->externalFormat != 0) {
+   const VkFormat external_format =
+      vk_android_get_external_format(pCreateInfo->pNext);
+   if (external_format != VK_FORMAT_UNDEFINED) {
       /* The spec requires VkImageCreateInfo::format be UNDEFINED when an external format is
        * supplied, but RADV reports externalFormat == the buffer's VkFormat (radv_android.c), so
        * apps that forward that value while also setting the real format (Winlator's AHB present
        * path does) are self-consistent, so vk_image_set_format below is then idempotent. Tolerate
        * that redundant case; still catch a genuinely conflicting format/externalFormat pair. */
-      assert(image->format == VK_FORMAT_UNDEFINED ||
-             image->format == (VkFormat)ext_format->externalFormat);
+      assert(image->format == VK_FORMAT_UNDEFINED || image->format == external_format);
       assert(image->external_handle_types &
              VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID);
-      vk_image_set_format(image, (VkFormat)ext_format->externalFormat);
+      vk_image_set_format(image, external_format);
    }
 
    image->ahb_format = vk_image_format_to_ahb_format(image->format);
@@ -151,6 +156,11 @@ vk_image_init(struct vk_device *device,
       vk_find_struct_const(pCreateInfo->pNext, IMAGE_COMPRESSION_CONTROL_EXT);
    if (compr_info)
       image->compr_flags = compr_info->flags;
+
+   const VkImageAlignmentControlCreateInfoMESA *align_info =
+      vk_find_struct_const(pCreateInfo->pNext, IMAGE_ALIGNMENT_CONTROL_CREATE_INFO_MESA);
+   if (align_info)
+      image->maximum_requested_alignment = align_info->maximumRequestedAlignment;
 }
 
 void *

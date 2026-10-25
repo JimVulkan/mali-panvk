@@ -27,7 +27,7 @@ VkResult panvk_per_arch(cmd_prepare_compute_push_uniforms)(
    struct panvk_cmd_buffer *cmdbuf, const struct panvk_shader_variant *shader,
    struct pan_ptr *push_uniforms);
 
-#if PAN_ARCH < 9
+#if PAN_ARCH < 10
 struct panvk_compute_sysvals;
 
 VkResult panvk_per_arch(cmd_prepare_gs_push_uniforms)(

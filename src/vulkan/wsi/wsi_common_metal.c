@@ -59,7 +59,10 @@ wsi_metal_surface_get_capabilities(VkIcdSurfaceBase *surface,
    if (!caps->surfaceCapabilities.currentExtent.width && !caps->surfaceCapabilities.currentExtent.height)
       caps->surfaceCapabilities.currentExtent.width = caps->surfaceCapabilities.currentExtent.height = UINT32_MAX;
 
-   caps->surfaceCapabilities.minImageCount = 2;
+   /* Force recommended 3 drawables, otherwise the OS frame pacing may slow
+    * down presentation.
+    */
+   caps->surfaceCapabilities.minImageCount = 3;
    caps->surfaceCapabilities.maxImageCount = 3;
 
    caps->surfaceCapabilities.minImageExtent = (VkExtent2D) { 1, 1 };
@@ -81,10 +84,6 @@ wsi_metal_surface_get_capabilities(VkIcdSurfaceBase *surface,
    VK_FROM_HANDLE(vk_physical_device, pdevice, wsi_device->pdevice);
    if (pdevice->supported_extensions.EXT_attachment_feedback_loop_layout)
       image_usage |= VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
-
-   VkSwapchainFlagsSurfaceCapabilitiesEXT *surface_caps = vk_find_struct(caps, SWAPCHAIN_FLAGS_SURFACE_CAPABILITIES_EXT);
-   if (surface_caps && pdevice->supported_extensions.EXT_multisampled_render_to_swapchain)
-      surface_caps->swapchainSupportedFlags |= VK_SWAPCHAIN_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT;
 
    VkImageUsageFlags2CreateInfoKHR *usage2 =
       vk_find_struct(caps->pNext, IMAGE_USAGE_FLAGS_2_CREATE_INFO_KHR);
@@ -122,18 +121,17 @@ wsi_metal_surface_get_capabilities2(VkIcdSurfaceBase *surface,
       wsi_metal_surface_get_capabilities(surface, wsi_device,
                                       caps);
 
-   vk_foreach_struct(ext, caps->pNext) {
-      switch (ext->sType) {
+   vk_foreach_struct(sType, ext, caps->pNext) {
+      switch (sType) {
       case VK_STRUCTURE_TYPE_SURFACE_PROTECTED_CAPABILITIES_KHR: {
-         VkSurfaceProtectedCapabilitiesKHR *protected = (void *)ext;
+         VkSurfaceProtectedCapabilitiesKHR *protected = ext;
          protected->supportsProtected = VK_FALSE;
          break;
       }
 
       case VK_STRUCTURE_TYPE_SURFACE_PRESENT_SCALING_CAPABILITIES_KHR: {
          /* TODO: support scaling */
-         VkSurfacePresentScalingCapabilitiesKHR *scaling =
-            (VkSurfacePresentScalingCapabilitiesKHR *)ext;
+         VkSurfacePresentScalingCapabilitiesKHR *scaling = ext;
          scaling->supportedPresentScaling = 0;
          scaling->supportedPresentGravityX = 0;
          scaling->supportedPresentGravityY = 0;
@@ -144,8 +142,7 @@ wsi_metal_surface_get_capabilities2(VkIcdSurfaceBase *surface,
 
       case VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_COMPATIBILITY_KHR: {
          /* Unsupported, just report the input present mode. */
-         VkSurfacePresentModeCompatibilityKHR *compat =
-            (VkSurfacePresentModeCompatibilityKHR *)ext;
+         VkSurfacePresentModeCompatibilityKHR *compat = ext;
          if (compat->pPresentModes) {
             if (compat->presentModeCount) {
                assert(present_mode);
@@ -163,7 +160,7 @@ wsi_metal_surface_get_capabilities2(VkIcdSurfaceBase *surface,
       }
 
       case VK_STRUCTURE_TYPE_PRESENT_TIMING_SURFACE_CAPABILITIES_EXT: {
-         VkPresentTimingSurfaceCapabilitiesEXT *wait = (void *)ext;
+         VkPresentTimingSurfaceCapabilitiesEXT *wait = ext;
 
          wait->presentStageQueries = 0;
          wait->presentTimingSupported = VK_FALSE;
@@ -171,6 +168,28 @@ wsi_metal_surface_get_capabilities2(VkIcdSurfaceBase *surface,
          wait->presentAtRelativeTimeSupported = VK_FALSE;
          break;
       }
+
+      case VK_STRUCTURE_TYPE_SWAPCHAIN_FLAGS_SURFACE_CAPABILITIES_EXT: {
+         VkSwapchainFlagsSurfaceCapabilitiesEXT *surface_caps = ext;
+         VK_FROM_HANDLE(vk_physical_device, pdevice, wsi_device->pdevice);
+
+         if (pdevice->supported_extensions.EXT_multisampled_render_to_swapchain)
+            surface_caps->swapchainSupportedFlags |= VK_SWAPCHAIN_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT;
+         if (pdevice->supported_extensions.KHR_bind_memory2)
+            surface_caps->swapchainSupportedFlags |= VK_SWAPCHAIN_CREATE_SPLIT_INSTANCE_BIND_REGIONS_BIT_KHR;
+         if (pdevice->supported_extensions.KHR_present_id2)
+            surface_caps->swapchainSupportedFlags |= VK_SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR;
+         if (pdevice->supported_extensions.KHR_present_wait2)
+            surface_caps->swapchainSupportedFlags |= VK_SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR;
+         if (pdevice->supported_extensions.KHR_swapchain_mutable_format)
+            surface_caps->swapchainSupportedFlags |= VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR;
+         if (pdevice->supported_extensions.EXT_present_timing)
+            surface_caps->swapchainSupportedFlags |= VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT;
+         if (pdevice->supported_extensions.KHR_swapchain_maintenance1 ||
+             pdevice->supported_extensions.EXT_swapchain_maintenance1)
+            surface_caps->swapchainSupportedFlags |= VK_SWAPCHAIN_CREATE_DEFERRED_MEMORY_ALLOCATION_BIT_EXT;
+      }
+      break;
 
       default:
          /* Ignored */
@@ -1076,7 +1095,7 @@ wsi_metal_create_mem(const struct wsi_swapchain *chain,
       .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
       .pNext = &image_mem_dedicated_info,
       .allocationSize = requirements.size,
-      .memoryTypeIndex = requirements.memoryTypeBits,
+      .memoryTypeIndex = wsi_select_device_memory_type(wsi, requirements.memoryTypeBits),
    };
 
    return wsi->AllocateMemory(chain->device, &image_mem_info,

@@ -13,6 +13,10 @@
 #include "kmod/kbase_kmod.h"
 #include "pan_desc.h"
 #include "pan_util.h"
+#include "poly/geometry.h"
+
+#include "vk_android.h"
+#include "vk_render_pass.h"
 
 static enum pan_fb_load_op
 get_att_fb_load_op(const VkRenderingAttachmentInfo *att)
@@ -118,6 +122,19 @@ avoid_direct_resolve_to(const struct pan_image *img)
 }
 
 static void
+panvk_fb_store_set_crc_header_addr(struct pan_fb_store_target *store,
+                                   const struct panvk_image_view *iview)
+{
+   if (!store->store || !pan_image_view_has_crc(&iview->pview))
+      return;
+
+   const struct panvk_image *image =
+      container_of(iview->vk.image, struct panvk_image, vk);
+
+   store->crc_header_addr = panvk_image_plane_crc_header_addr(image);
+}
+
+static void
 render_state_set_color_attachment(struct panvk_cmd_buffer *cmdbuf,
                                   const VkRenderingAttachmentInfo *att,
                                   uint32_t index)
@@ -137,14 +154,23 @@ render_state_set_color_attachment(struct panvk_cmd_buffer *cmdbuf,
    struct panvk_image *img =
       container_of(iview->vk.image, struct panvk_image, vk);
 
+   /* With Android efr, the image view can be the YUV resolve target. Map it to
+    * the resolved RGBA format targeted by the graphics pipeline.
+    */
+   VkFormat fmt = iview->vk.format;
+   if (vk_format_get_ycbcr_info(fmt)) {
+      fmt = vk_external_format_to_efr_format(fmt);
+      assert(fmt != VK_FORMAT_UNDEFINED);
+   }
+
    render->bound_attachments |= MESA_VK_RP_ATTACHMENT_COLOR_BIT(index);
    render->color_attachments.iviews[index] = iview;
    render->color_attachments.preload_iviews[index] =
       ms2ss ? iview_ss : NULL;
-   render->color_attachments.fmts[index] = iview->vk.format;
+   render->color_attachments.fmts[index] = fmt;
    render->color_attachments.samples[index] = img->vk.samples;
 
-#if PAN_ARCH < 9
+#if PAN_ARCH < 10
    for (uint8_t p = 0; p < ARRAY_SIZE(iview->pview.planes); p++) {
       struct pan_image_plane_ref pref =
          pan_image_view_get_plane(&iview->pview, p);
@@ -180,8 +206,12 @@ render_state_set_color_attachment(struct panvk_cmd_buffer *cmdbuf,
    };
    render->fb.spill.load.rts[index] = pan_fb_load_iview(&iview->pview);
    render->fb.spill.store.rts[index] = pan_fb_store_iview(&iview->pview);
-   if (att->storeOp == VK_ATTACHMENT_STORE_OP_STORE && !ms2ss)
+   panvk_fb_store_set_crc_header_addr(&render->fb.spill.store.rts[index],
+                                      iview);
+   if (att->storeOp == VK_ATTACHMENT_STORE_OP_STORE && !ms2ss) {
       render->fb.store.rts[index] = pan_fb_store_iview(&iview->pview);
+      panvk_fb_store_set_crc_header_addr(&render->fb.store.rts[index], iview);
+   }
 
    if (att->resolveMode != VK_RESOLVE_MODE_NONE) {
       VK_FROM_HANDLE(panvk_image_view, resolve_iview, att->resolveImageView);
@@ -195,6 +225,7 @@ render_state_set_color_attachment(struct panvk_cmd_buffer *cmdbuf,
       const struct panvk_resolve_attachment resolve = {
          .dst_iview = ms2ss ? iview_ss : resolve_iview,
          .mode = att->resolveMode,
+         .flags = vk_get_rendering_attachment_flags(att),
       };
       assert(resolve.dst_iview != NULL);
       assert(resolve.dst_iview->pview.nr_samples == 1);
@@ -202,8 +233,17 @@ render_state_set_color_attachment(struct panvk_cmd_buffer *cmdbuf,
       const struct pan_image *resolve_pimage =
          pan_image_view_get_color_plane(&resolve.dst_iview->pview).image;
 
+      /* The tile buffer holds linear values, an in-tile resolve always
+       * applies the transfer function.
+       */
+      const bool skip_transfer_function =
+         (resolve.flags &
+          VK_RENDERING_ATTACHMENT_RESOLVE_SKIP_TRANSFER_FUNCTION_BIT_KHR) &&
+         vk_format_is_srgb(fmt);
+
       if ((ms2ss || att->storeOp != VK_ATTACHMENT_STORE_OP_STORE) &&
-          !avoid_direct_resolve_to(resolve_pimage)) {
+          !avoid_direct_resolve_to(resolve_pimage) &&
+          !skip_transfer_function) {
          render->fb.resolve.rts[index] = (struct pan_fb_resolve_target) {
             .in_bounds = {
                .resolve = PAN_FB_RESOLVE_RT(index),
@@ -217,9 +257,13 @@ render_state_set_color_attachment(struct panvk_cmd_buffer *cmdbuf,
          };
          render->fb.store.rts[index] =
             pan_fb_always_store_iview_s0(&resolve.dst_iview->pview);
+         panvk_fb_store_set_crc_header_addr(&render->fb.store.rts[index],
+                                            resolve.dst_iview);
       } else {
          /* We need to store so we can do the MSAA resolve later */
          render->fb.store.rts[index] = pan_fb_store_iview(&iview->pview);
+         panvk_fb_store_set_crc_header_addr(&render->fb.store.rts[index],
+                                            iview);
          render->color_attachments.resolve[index] = resolve;
       }
    }
@@ -318,7 +362,7 @@ render_state_set_zs_attachments(struct panvk_cmd_buffer *cmdbuf,
          MAX2(render->fb.nr_samples,
               pan_image_view_get_nr_samples(&z_iview->pview));
 
-#if PAN_ARCH < 9
+#if PAN_ARCH < 10
       /* Depth plane always comes first. */
       render->fb.bos[render->fb.bo_count++] = z_img->planes[0].mem->bo;
 #endif
@@ -342,8 +386,9 @@ render_state_set_zs_attachments(struct panvk_cmd_buffer *cmdbuf,
          MAX2(render->fb.nr_samples,
               pan_image_view_get_nr_samples(&s_iview->pview));
 
-#if PAN_ARCH < 9
+#if PAN_ARCH < 10
       /* The stencil plane is always last. */
+
       render->fb.bos[render->fb.bo_count++] =
          s_img->planes[s_img->plane_count - 1].mem->bo;
 #endif
@@ -1112,7 +1157,7 @@ panvk_per_arch(CmdBindIndexBuffer2)(VkCommandBuffer commandBuffer,
          VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT_KHR;
       struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
       cmdbuf->state.gfx.ib.cpu_readable =
-         PAN_ARCH < 9 && pan_kmod_dev_is_kbase(dev->kmod.dev) &&
+         PAN_ARCH < 10 && pan_kmod_dev_is_kbase(dev->kmod.dev) &&
          cmdbuf->state.gfx.ib.dev_addr && !(buf->vk.usage & gpu_writes);
    } else {
       cmdbuf->state.gfx.ib.cpu_readable = false;
