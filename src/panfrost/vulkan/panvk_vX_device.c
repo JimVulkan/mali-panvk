@@ -719,6 +719,7 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
 
    simple_mtx_init(&device->as.lock, mtx_plain);
    simple_mtx_init(&device->polygon_gs.lock, mtx_plain);
+   util_dynarray_init(&device->xfb_gs, NULL);
 
    panvk_device_init_mempools(device);
 
@@ -735,12 +736,16 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
 #endif
 
 #if PAN_ARCH <= 9
-   result = panvk_priv_bo_create(
-      device, 128 * 1024 * 1024,
-      PAN_KMOD_BO_FLAG_NO_MMAP | PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT,
-      VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, &device->tiler_heap);
-   if (result != VK_SUCCESS)
-      goto err_free_priv_bos;
+   /* Separate BOs, not halves of one: a grow-on-fault heap is committed from its start up to the
+    * faulting page, so a second half would commit the whole first one. */
+   for (unsigned i = 0; i < (pan_kmod_dev_is_kbase(device->kmod.dev) ? 2 : 1); i++) {
+      result = panvk_priv_bo_create(
+         device, 128 * 1024 * 1024,
+         PAN_KMOD_BO_FLAG_NO_MMAP | PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT,
+         VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, &device->tiler_heap[i]);
+      if (result != VK_SUCCESS)
+         goto err_free_priv_bos;
+   }
 #endif
 
 #if PAN_ARCH < 9
@@ -750,6 +755,16 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
       VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, &device->tess_heap);
    if (result != VK_SUCCESS)
       goto err_free_priv_bos;
+#else
+   /* Committed up front: panthor has no grow-on-fault memory, and the tessellator's allocations
+    * stay inside it (panlib_tess_prefix_sum). Only for devices that can tessellate. v9 commits
+    * it too, as the tessellation path it shares with CSF was tested that way. */
+   if (device->vk.enabled_features.tessellationShader) {
+      result = panvk_priv_bo_create(device, PANVK_TESS_HEAP_SIZE, PAN_KMOD_BO_FLAG_NO_MMAP,
+                                    VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, &device->tess_heap);
+      if (result != VK_SUCCESS)
+         goto err_free_priv_bos;
+   }
 #endif
 
    result = panvk_priv_bo_create(
@@ -879,7 +894,8 @@ err_free_priv_bos:
    simple_mtx_destroy(&device->poly_heap.init_lock);
 #endif
    panvk_priv_bo_unref(device->tess_heap);
-   panvk_priv_bo_unref(device->tiler_heap);
+   panvk_priv_bo_unref(device->tiler_heap[0]);
+   panvk_priv_bo_unref(device->tiler_heap[1]);
    panvk_device_cleanup_mempools(device);
    vk_free(&device->vk.alloc, device->dump_region_size);
    pan_kmod_vm_destroy(device->kmod.vm);
@@ -921,6 +937,7 @@ panvk_per_arch(destroy_device)(struct panvk_device *device,
       if (device->polygon_gs.shader[i])
          vk_shader_destroy(&device->vk, device->polygon_gs.shader[i], NULL);
    }
+   panvk_per_arch(destroy_xfb_passthrough_gs)(device);
    simple_mtx_destroy(&device->polygon_gs.lock);
 
    panvk_precomp_cleanup(device);
@@ -940,7 +957,8 @@ panvk_per_arch(destroy_device)(struct panvk_device *device,
    simple_mtx_destroy(&device->poly_heap.init_lock);
 #endif
    panvk_priv_bo_unref(device->tess_heap);
-   panvk_priv_bo_unref(device->tiler_heap);
+   panvk_priv_bo_unref(device->tiler_heap[0]);
+   panvk_priv_bo_unref(device->tiler_heap[1]);
    panvk_priv_bo_unref(device->sample_positions);
    panvk_device_cleanup_mempools(device);
    vk_free(&device->vk.alloc, device->dump_region_size);

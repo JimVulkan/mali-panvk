@@ -36,6 +36,7 @@
 
 struct panvk_device;
 struct panvk_physical_device;
+struct pan_kmod_kbase_csf_group;
 
 enum panvk_bc_emu_profile {
    PANVK_BC_EMU_NONE,
@@ -63,7 +64,10 @@ struct panvk_bc_emu_state {
    struct list_head linear_images;
    VkCommandPool refresh_pool;
    VkCommandBuffer refresh[4];
-   unsigned refresh_next;
+   /* The submission that last ran each ring slot (group NULL on JM). */
+   struct pan_kmod_kbase_csf_group *refresh_group[4];
+   uint64_t refresh_seq[4];
+   unsigned refresh_next, refresh_cur;
 
    simple_mtx_t lock;
    /* 4 KB of statistics the shader may write, the BC5 -> EAC tables (eac_lut.h), then the
@@ -123,16 +127,21 @@ void panvk_bc_emu_track_linear(struct panvk_device *dev, struct panvk_image *img
 void panvk_bc_emu_untrack_image(struct panvk_device *dev, struct panvk_image *img);
 void panvk_bc_emu_untrack_memory(struct panvk_device *dev, const struct panvk_device_memory *mem);
 
+/* Waits for submission seq of a CSF queue group, or of the JM queue when group is NULL. */
+void panvk_bc_emu_wait(struct panvk_device *dev, struct pan_kmod_kbase_csf_group *group,
+                       uint64_t seq);
+
 #ifdef PAN_ARCH
 #include "panvk_macros.h"
 
 /* For the kbase submit path: with linear images listed, record the refresh into the next command
  * buffer of the ring and return it with linear_lock held; the caller submits it ahead of the
  * app's command buffers and calls bc_emu_refresh_end with the submission's sequence number
- * (0 if it failed). Without any, NULL and nothing held. */
+ * (0 if it failed) and, on CSF, the queue group it went to. Without any, NULL and nothing held. */
 struct panvk_cmd_buffer *panvk_per_arch(bc_emu_refresh_begin)(struct panvk_device *dev);
 void panvk_per_arch(bc_emu_refresh_end)(struct panvk_device *dev,
-                                        struct panvk_cmd_buffer *cmdbuf, uint64_t seq);
+                                        struct panvk_cmd_buffer *cmdbuf,
+                                        struct pan_kmod_kbase_csf_group *group, uint64_t seq);
 #endif
 
 #endif

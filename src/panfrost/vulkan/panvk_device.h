@@ -25,6 +25,7 @@
 
 #include "util/simple_mtx.h"
 #include "util/u_call_once.h"
+#include "util/u_dynarray.h"
 #include "util/u_printf.h"
 #include "util/vma.h"
 
@@ -68,7 +69,11 @@ struct panvk_device {
       struct pan_kmod_allocator allocator;
    } kmod;
 
-   struct panvk_priv_bo *tiler_heap;
+   /* JM tiler heaps. kbase gets two, and batches take turns (tiler_heap_next): a vertex/tiler
+    * job may then run while the previous batch's fragment job still reads the other one. The DRM
+    * path has [0] only. */
+   struct panvk_priv_bo *tiler_heap[2];
+   unsigned tiler_heap_next;
    struct panvk_priv_bo *sample_positions;
    /* v6/v7 tessellation: the domain points and index buffers the tessellator writes, reused by
     * every batch (see panlib_tess_prefix_sum). */
@@ -80,6 +85,12 @@ struct panvk_device {
       simple_mtx_t lock;
       struct vk_shader *shader[2];
    } polygon_gs;
+
+   /* v6/v7: the internal pass-through geometry shaders that capture the transform feedback of a
+    * vertex shader with no geometry or tess stage after it, one per xfb layout and input
+    * primitive class, built on first use (panvk_per_arch(xfb_passthrough_gs)). Under
+    * polygon_gs.lock. */
+   struct util_dynarray xfb_gs;
 
    /* Bifrost (v6/v7) has no NULL descriptor. With nullDescriptor enabled, a null write copies one
     * of these instead: a texture reading zeros (an internal 1x1 image with a ZERO swizzle), and a

@@ -67,6 +67,9 @@ panvk_add_wait_event_operation(struct panvk_cmd_buffer *cmdbuf,
       }
       util_dynarray_append(&cmdbuf->cur_batch->event_ops, op);
    }
+
+   /* kbase: the wait is the queue order, which has to include the fragment jobs before it. */
+   cmdbuf->cur_batch->order |= PANVK_BATCH_WAIT_FRAG;
 }
 
 VKAPI_ATTR void VKAPI_CALL

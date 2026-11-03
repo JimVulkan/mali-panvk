@@ -21,6 +21,10 @@ if dep_android_ui.found()
   files_u_gralloc += files('u_gralloc_imapper5_api.cpp')
   c_args_for_u_gralloc += '-DUSE_IMAPPER4_METADATA_API'
   cpp_args_for_u_gralloc += '-DUSE_IMAPPER4_METADATA_API'
+  # XCLIPSE: libui is built with the platform libc++ (std::__1), see the mapper4 branch below.
+  if get_option('xclipse-gralloc-deps') != ''
+    cpp_args_for_u_gralloc += ['-isystem', get_option('xclipse-gralloc-deps') / 'abi_override/c++/v1']
+  endif
   options_for_u_gralloc += 'cpp_std=c++17'
   deps_for_u_gralloc += dep_android_ui
 elif dep_android_mapper4.found()

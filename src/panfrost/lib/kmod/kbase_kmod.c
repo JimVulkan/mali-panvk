@@ -138,8 +138,15 @@ union kbase_ioctl_mem_import {
       uint64_t gpu_va;
       uint64_t va_pages;
    } out;
+   /* The kbase of the Tab S12+ (MT6993, kernel 6.12) takes 40 bytes: its ioctl number is
+    * 0xc0288016 (read off the vendor libGLES_mali.so), and the 24-byte one gets ENOTTY. The
+    * vendor fills the same in/out fields and zeroes the rest. */
+   uint8_t pad40[40];
 };
-#define KBASE_IOCTL_MEM_IMPORT _IOWR(KBASE_IOCTL_TYPE, 22, union kbase_ioctl_mem_import)
+#define KBASE_IOCTL_MEM_IMPORT                                                                    \
+   _IOC(_IOC_READ | _IOC_WRITE, KBASE_IOCTL_TYPE, 22, 24)
+#define KBASE_IOCTL_MEM_IMPORT_40                                                                 \
+   _IOC(_IOC_READ | _IOC_WRITE, KBASE_IOCTL_TYPE, 22, 40)
 #define BASE_MEM_IMPORT_TYPE_UMM 2
 #define BASE_MEM_SAME_VA         (1ull << 13)
 /* What a SAME_VA import reports back instead of SAME_VA: gpu_va is a cookie to mmap. Measured,
@@ -228,6 +235,7 @@ enum kbase_gpuprop {
    KBASE_GPUPROP_RAW_MMU_FEATURES = 32,
    KBASE_GPUPROP_RAW_AS_PRESENT = 33,
    KBASE_GPUPROP_RAW_JS_PRESENT = 34,
+   KBASE_GPUPROP_RAW_JS_FEATURES_0 = 35,
    /* 51, NOT 84. 84 is TLS_ALLOC, which is also present in the stream, so reading it did not
     * fall back to the default -- it fed Mesa 0x300 where the real value is 0x809. Decoded, that
     * is a tiler with a 1-BYTE bin and 3 hierarchy levels instead of 512 bytes and 8, i.e. a
@@ -237,6 +245,8 @@ enum kbase_gpuprop {
    KBASE_GPUPROP_RAW_TILER_FEATURES = 51,
    KBASE_GPUPROP_RAW_THREAD_FEATURES = 59,
    KBASE_GPUPROP_TLS_ALLOC = 84,
+   /* GPU_FEATURES, from kbase r43 on (absent from r38p1 and older). */
+   KBASE_GPUPROP_RAW_GPU_FEATURES = 85,
 };
 
 
@@ -250,7 +260,8 @@ struct kbase_queue {
    struct kbase_sub *owner[256];     /* by atom number, NULL when free */
    bool is_fence[256];
    unsigned free_atoms;              /* of the numbers 1..255 */
-   uint8_t last_atom;                /* the newest atom in flight, 0 if none */
+   /* The newest atom in flight on each PAN_KMOD_KBASE_TRACK_*, 0 if none. */
+   uint8_t track[PAN_KMOD_KBASE_NR_TRACKS];
    uint64_t next_seq;
    /* Submissions whose callback has not run yet. A fence-only submission (a present) completes on
     * a soft atom, which can report after a later submission's GPU atoms: completion is tracked per
@@ -269,6 +280,9 @@ struct kbase_kmod_dev {
    struct kbase_queue queue;
    /* enum kbase_atom_layout, measured when the context is created. */
    int atom_layout;
+   /* JS0_FEATURES: bit n = the fragment slot runs job type n (G72: NULL, WRITE_VALUE,
+    * CACHE_FLUSH, FRAGMENT). */
+   uint32_t js0_features;
    /* CSF: queue groups instead of job atoms (kbase UAPI 1.x). */
    bool csf;
    struct drm_panthor_csif_info csif;
@@ -318,7 +332,7 @@ kbase_gpuprop_get(const uint8_t *buf, unsigned size, unsigned want, uint64_t dfl
 }
 
 static bool
-kbase_kmod_query_props(int fd, struct pan_kmod_dev_props *props)
+kbase_kmod_query_props(int fd, struct pan_kmod_dev_props *props, uint32_t *js0_features)
 {
    struct kbase_ioctl_get_gpuprops req = {0};
 
@@ -357,6 +371,7 @@ kbase_kmod_query_props(int fd, struct pan_kmod_dev_props *props)
    props->mem_features = P(RAW_MEM_FEATURES, 0);
    props->mmu_features = P(RAW_MMU_FEATURES, 0x2830);
    props->l2_features = P(RAW_L2_FEATURES, 0);
+   *js0_features = P(RAW_JS_FEATURES_0, 0);
 
    props->texture_features[0] = P(TEXTURE_FEATURES_0, 0);
    /* PROBE ONLY: OR extra compressed-format bits into what the GPU reports, to ask the texture
@@ -396,6 +411,15 @@ kbase_kmod_query_props(int fd, struct pan_kmod_dev_props *props)
       }
       props->max_tls_instance_per_core = props->max_threads_per_core;
       props->afbc_features = 0;
+
+      /* GPU_FEATURES bit 2 (RAY_INTERSECTION) is what tells an Immortalis part from the plain
+       * Mali one in pan_get_model. Left at 0, the Tab S11's Immortalis-G925 MC12 called itself
+       * a G725. Kernels before r43 do not export the register; there Arm's own configurations
+       * decide, since G715, G720 and G725 only come with 10 or more cores as Immortalis. */
+      props->gpu_features = P(RAW_GPU_FEATURES, UINT64_MAX);
+      if (props->gpu_features == UINT64_MAX)
+         props->gpu_features =
+            __builtin_popcountll(props->shader_present) >= 10 ? (1ull << 2) : 0;
    }
 
    /* Matching panfrost_kmod: Mali MMUs take 4K and 2M pages. Coherency is left off
@@ -521,7 +545,7 @@ kbase_kmod_dev_create(int fd, uint32_t flags, const struct pan_kmod_allocator *a
       goto err_free_dev;
    }
 
-   if (!kbase_kmod_query_props(fd, &kbase_dev->base.props)) {
+   if (!kbase_kmod_query_props(fd, &kbase_dev->base.props, &kbase_dev->js0_features)) {
       pan_kmod_dev_cleanup(&kbase_dev->base);
       goto err_free_dev;
    }
@@ -761,14 +785,20 @@ kbase_kmod_bo_import(struct pan_kmod_dev *dev, int fd)
    /* CPU and GPU read/write, SAME_VA. Not COHERENT_LOCAL: that is a property of memory kbase
     * allocates, and an import is the exporter's. */
    int dmabuf = fd;
-   union kbase_ioctl_mem_import req = {
-      .in = {
-         .flags = 0xfull | BASE_MEM_SAME_VA,
-         .phandle = (uint64_t)(uintptr_t)&dmabuf,
-         .type = BASE_MEM_IMPORT_TYPE_UMM,
-      },
-   };
-   if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_MEM_IMPORT, &req)) {
+   union kbase_ioctl_mem_import req;
+   memset(&req, 0, sizeof(req));
+   req.in.flags = 0xfull | BASE_MEM_SAME_VA;
+   req.in.phandle = (uint64_t)(uintptr_t)&dmabuf;
+   req.in.type = BASE_MEM_IMPORT_TYPE_UMM;
+   static bool import_40;
+   int ret = pan_kmod_ioctl(dev->fd, import_40 ? KBASE_IOCTL_MEM_IMPORT_40
+                                                : KBASE_IOCTL_MEM_IMPORT, &req);
+   if (ret && errno == ENOTTY && !import_40) {
+      ret = pan_kmod_ioctl(dev->fd, KBASE_IOCTL_MEM_IMPORT_40, &req);
+      if (!ret)
+         import_40 = true;
+   }
+   if (ret) {
       mesa_loge("kbase: MEM_IMPORT of dma-buf fd %d failed (err=%d)", fd, errno);
       pan_kmod_dev_free(dev, bo);
       return NULL;
@@ -1562,8 +1592,10 @@ kbase_event_thread(void *arg)
          }
          q->owner[an] = NULL;
          q->free_atoms++;
-         if (q->last_atom == an)
-            q->last_atom = 0;
+         for (unsigned t = 0; t < PAN_KMOD_KBASE_NR_TRACKS; t++) {
+            if (q->track[t] == an)
+               q->track[t] = 0;
+         }
          if (ev[i].event_code != KBASE_JD_EVENT_DONE) {
             if (q->is_fence[an] && !sub->done) {
                if (!q->fence_warned) {
@@ -1634,6 +1666,25 @@ kbase_queue_finish(struct kbase_kmod_dev *kdev)
    pthread_mutex_destroy(&q->lock);
 }
 
+/* Adds an ORDER dependency on atom id (0: nothing to wait for) unless the atom already waits for
+ * it. False when both slots are taken. */
+static bool
+kbase_add_order_dep(struct kbase_jd_atom *jd, uint8_t id)
+{
+   if (!id)
+      return true;
+   for (unsigned s = 0; s < 2; s++) {
+      if (jd->pre_dep[s].atom_id == id)
+         return true;
+      if (!jd->pre_dep[s].atom_id) {
+         jd->pre_dep[s].atom_id = id;
+         jd->pre_dep[s].dependency_type = KBASE_JD_DEP_ORDER;
+         return true;
+      }
+   }
+   return false;
+}
+
 uint64_t
 pan_kmod_kbase_submit_async(struct pan_kmod_dev *dev, const struct pan_kmod_kbase_atom *atoms,
                             unsigned nr_atoms, int *fence_fd, pan_kmod_kbase_done_cb done,
@@ -1662,7 +1713,10 @@ pan_kmod_kbase_submit_async(struct pan_kmod_dev *dev, const struct pan_kmod_kbas
    }
 
    const uint64_t seq = q->next_seq++;
-   const bool fence = fence_fd && (nr_atoms || q->last_atom);
+   const bool fence =
+      fence_fd && (nr_atoms || q->track[0] || q->track[1]);
+   static_assert(PAN_KMOD_KBASE_TRACK_VTC == 1 && PAN_KMOD_KBASE_TRACK_FRAG == 2,
+                 "track 0 is VTC and track 1 FRAG");
    const unsigned need = nr_atoms + fence;
 
    if (!need) {
@@ -1711,6 +1765,10 @@ pan_kmod_kbase_submit_async(struct pan_kmod_dev *dev, const struct pan_kmod_kbas
    for (unsigned i = 0; i < nr_atoms; i++)
       rel_to_real[atoms[i].atom_number] = real[i];
 
+   /* The tracks as they will be once this submission is in, committed if the kernel takes it. */
+   uint8_t track[PAN_KMOD_KBASE_NR_TRACKS];
+   memcpy(track, q->track, sizeof(track));
+
    struct kbase_jd_atom jd[PAN_KMOD_KBASE_MAX_ATOMS + 1];
    memset(jd, 0, need * sizeof(jd[0]));
    for (unsigned i = 0; i < nr_atoms; i++) {
@@ -1722,12 +1780,26 @@ pan_kmod_kbase_submit_async(struct pan_kmod_dev *dev, const struct pan_kmod_kbas
        * tells our events from anyone else's on the context. */
       jd[i].udata[0] = KBASE_ATOM_TAG;
       jd[i].udata[1] = seq;
+      const bool all = !atoms[i].wait && !atoms[i].join;
       if (atoms[i].dep_atom) {
          jd[i].pre_dep[0].atom_id = rel_to_real[atoms[i].dep_atom];
          jd[i].pre_dep[0].dependency_type = KBASE_JD_DEP_DATA;
-      } else if (q->last_atom) {
-         jd[i].pre_dep[0].atom_id = q->last_atom;
-         jd[i].pre_dep[0].dependency_type = KBASE_JD_DEP_ORDER;
+      }
+      /* Everything before: the newest vertex/tiler and fragment atoms, which each come after
+       * every earlier one of their kind. */
+      const uint8_t wait = all ? (atoms[i].dep_atom ? 0 : PAN_KMOD_KBASE_TRACK_VTC |
+                                                         PAN_KMOD_KBASE_TRACK_FRAG)
+                               : atoms[i].wait;
+      for (unsigned t = 0; t < PAN_KMOD_KBASE_NR_TRACKS; t++) {
+         if ((wait & (1u << t)) && !kbase_add_order_dep(&jd[i], track[t])) {
+            mesa_loge("kbase: atom %u waits for more than two atoms", atoms[i].atom_number);
+            assert(!"too many atom waits");
+         }
+      }
+      const uint8_t join = all ? (1u << PAN_KMOD_KBASE_NR_TRACKS) - 1 : atoms[i].join;
+      for (unsigned t = 0; t < PAN_KMOD_KBASE_NR_TRACKS; t++) {
+         if (join & (1u << t))
+            track[t] = real[i];
       }
    }
 
@@ -1743,8 +1815,9 @@ pan_kmod_kbase_submit_async(struct pan_kmod_dev *dev, const struct pan_kmod_kbas
       f->atom_number = real[nr_atoms];
       f->udata[0] = KBASE_ATOM_TAG;
       f->udata[1] = seq;
-      f->pre_dep[0].atom_id = nr_atoms ? real[nr_atoms - 1] : q->last_atom;
-      f->pre_dep[0].dependency_type = KBASE_JD_DEP_ORDER;
+      /* After everything, this submission's atoms included. */
+      kbase_add_order_dep(f, track[0]);
+      kbase_add_order_dep(f, track[1]);
    }
 
    uint8_t packed[(PAN_KMOD_KBASE_MAX_ATOMS + 1) * KBASE_ATOM_STRIDE];
@@ -1768,10 +1841,8 @@ pan_kmod_kbase_submit_async(struct pan_kmod_dev *dev, const struct pan_kmod_kbas
    }
 
    q->free_atoms -= need;
-   /* What the next submission waits on: the last GPU atom, not a fence atom. */
-   /* A fence alone leaves it on the GPU atom the fence waits for. */
-   if (nr_atoms)
-      q->last_atom = real[nr_atoms - 1];
+   /* What later atoms wait on: GPU atoms, never a fence atom. */
+   memcpy(q->track, track, sizeof(track));
    q->in_flight += split ? 2 : 1;
    q->open_seq[q->nr_open_seq++] = seq;
    pthread_mutex_unlock(&q->lock);
@@ -2219,6 +2290,13 @@ const struct drm_panthor_csif_info *
 pan_kmod_kbase_csif_props(const struct pan_kmod_dev *dev)
 {
    return &container_of(dev, struct kbase_kmod_dev, base)->csif;
+}
+
+bool
+pan_kmod_kbase_frag_slot_writes(const struct pan_kmod_dev *dev)
+{
+   return pan_kmod_dev_is_kbase(dev) &&
+          (container_of(dev, struct kbase_kmod_dev, base)->js0_features & (1u << 2));
 }
 
 static bool

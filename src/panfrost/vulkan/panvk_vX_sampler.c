@@ -179,6 +179,39 @@ panvk_sampler_fill_desc(const struct VkSamplerCreateInfo *info,
    }
 }
 
+void
+panvk_per_arch(sampler_state_fill_desc)(const struct vk_sampler_state *s,
+                                        struct mali_sampler_packed *desc)
+{
+   const VkSamplerCreateInfo info = {
+      .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+      .flags = s->flags,
+      .magFilter = s->mag_filter,
+      .minFilter = s->min_filter,
+      .mipmapMode = s->mipmap_mode,
+      .addressModeU = s->address_mode_u,
+      .addressModeV = s->address_mode_v,
+      .addressModeW = s->address_mode_w,
+      .mipLodBias = s->mip_lod_bias,
+      .anisotropyEnable = s->anisotropy_enable,
+      .maxAnisotropy = s->max_anisotropy,
+      .compareEnable = s->compare_enable,
+      .compareOp = s->compare_op,
+      .minLod = s->min_lod,
+      .maxLod = s->max_lod,
+      .borderColor = s->border_color,
+      .unnormalizedCoordinates = s->unnormalized_coordinates,
+   };
+   VkClearColorValue border_color = s->border_color_value;
+
+#if PAN_ARCH == 7
+   panvk_afbc_reswizzle_border_color(&border_color, s->format);
+#endif
+
+   panvk_sampler_fill_desc(&info, desc, border_color, s->min_filter,
+                           s->mag_filter, s->reduction_mode, s->flags);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 panvk_per_arch(CreateSampler)(VkDevice _device,
                               const VkSamplerCreateInfo *pCreateInfo,

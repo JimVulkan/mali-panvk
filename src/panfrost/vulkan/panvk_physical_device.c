@@ -13,6 +13,13 @@
 
 #include <sys/stat.h>
 
+#include "util/detect_os.h"
+
+#if DETECT_OS_ANDROID
+#include <dlfcn.h>
+#include <unistd.h>
+#endif
+
 #include "util/disk_cache.h"
 #include "util/os_misc.h"
 #include "util/u_atomic.h"
@@ -145,6 +152,37 @@ get_drm_device_ids(struct panvk_physical_device *device,
    return VK_SUCCESS;
 }
 
+#if defined(ENABLE_SHADER_CACHE) && DETECT_OS_ANDROID
+/* Upstream keeps the disk shader cache off on Android, and apps have no HOME, so every launch
+ * recompiled every pipeline (the app's and our BC decoders). Give the cache an app-private
+ * directory: $TMPDIR, else the directory this .so was loaded from. Only /data/ paths, never FUSE
+ * external storage, since cache reads run on the compiling thread. MESA_SHADER_CACHE_DISABLE and
+ * MESA_SHADER_CACHE_DIR still win. Same scheme as RADV on Xclipse. */
+static void
+panvk_android_disk_cache_dir(void)
+{
+   char dir[512] = {0};
+   const char *t = getenv("TMPDIR");
+
+   if (t && !strncmp(t, "/data/", 6) && access(t, W_OK) == 0) {
+      snprintf(dir, sizeof(dir), "%s", t);
+   } else {
+      Dl_info info;
+      if (dladdr((void *)panvk_android_disk_cache_dir, &info) && info.dli_fname &&
+          !strncmp(info.dli_fname, "/data/", 6)) {
+         snprintf(dir, sizeof(dir), "%s", info.dli_fname);
+         char *slash = strrchr(dir, '/');
+         if (slash)
+            *slash = '\0';
+         if (access(dir, W_OK) != 0)
+            dir[0] = '\0';
+      }
+   }
+
+   disk_cache_set_default_dir(dir[0] ? dir : NULL);
+}
+#endif
+
 static void
 init_shader_caches(struct panvk_physical_device *device,
                    const struct panvk_instance *instance)
@@ -176,6 +214,9 @@ init_shader_caches(struct panvk_physical_device *device,
    _mesa_blake3_format(timestamp, instance->driver_build_sha);
 
    const uint64_t driver_flags = pan_get_compiler_flags(pan_arch(gpu_id));
+#if DETECT_OS_ANDROID
+   panvk_android_disk_cache_dir();
+#endif
    device->vk.disk_cache = disk_cache_create(renderer, timestamp, driver_flags);
 #endif
 }
@@ -579,8 +620,9 @@ panvk_GetPhysicalDeviceQueueFamilyProperties2(
          /* On v10+ we can support up to 127 queues but this causes timeout on
             some CTS tests */
          .queueCount = arch >= 10 ? 2 : 1,
+         /* JM: kbase only (WRITE_VALUE SYSTEM_TIMESTAMP with BASE_JD_REQ_PERMON). */
          .timestampValidBits =
-            arch >= 10 &&
+            (arch >= 10 || pan_kmod_dev_is_kbase(physical_device->kmod.dev)) &&
                   physical_device->kmod.dev->props.gpu_can_query_timestamp
                ? 64
                : 0,

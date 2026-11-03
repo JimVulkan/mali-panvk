@@ -923,6 +923,170 @@ bi_lower_vector(bi_context *ctx, unsigned first_reg)
    }
 }
 
+static bool bi_is_tied(const bi_instr *I);
+
+/*
+ * Coalesce the sources of vector collects into the collect's destination: a
+ * source whose only definition writes one register is renamed to the component
+ * of the vector it would be moved into, so the value is computed in place.
+ * bi_lower_vector would otherwise emit a move per component, and LCRA cannot
+ * coalesce those. They are the staging vectors of TEX, STORE and BLEND, and the
+ * largest class of instructions Kraid saves over this compiler (about 5% of all
+ * instructions in shader-db).
+ *
+ * Only SSA values below first_reg (not phi webs) with one single-register
+ * definition and no modifiers are taken, each into one collect. Operands with
+ * fixed registers (blend, coverage, tied staging) keep their moves.
+ *
+ * A coalesced vector is live from its first component's definition, which can
+ * cost a thread or force spilling: bi_register_allocate then starts over from a
+ * snapshot without coalescing.
+ */
+static bool
+bi_coalesce_collects(bi_context *ctx, unsigned first_reg)
+{
+   bi_instr **def = calloc(first_reg, sizeof(*def));
+   BITSET_WORD *skip = BITSET_CALLOC(first_reg);
+   bi_index *rename = calloc(first_reg, sizeof(*rename));
+   bool any = false;
+
+   bi_foreach_instr_global(ctx, I) {
+      const bool fixed = I->op == BI_OPCODE_BLEND || I->op == BI_OPCODE_ATEST ||
+                         I->op == BI_OPCODE_ZS_EMIT || I->op == BI_OPCODE_PHI ||
+                         I->op == BI_OPCODE_SPLIT_I32 ||
+                         I->op == BI_OPCODE_COLLECT_I32 || bi_is_tied(I);
+
+      bi_foreach_dest(I, d) {
+         const unsigned v = I->dest[d].value;
+         if (I->dest[d].type != BI_INDEX_NORMAL || v >= first_reg)
+            continue;
+         if (def[v] || fixed || I->dest[d].offset || I->dest[d].memory ||
+             bi_count_write_registers(I, d) != 1)
+            BITSET_SET(skip, v);
+         def[v] = I;
+      }
+
+      if (fixed && I->op != BI_OPCODE_COLLECT_I32) {
+         bi_foreach_ssa_src(I, s) {
+            if (I->src[s].value < first_reg)
+               BITSET_SET(skip, I->src[s].value);
+         }
+      }
+   }
+
+   bi_foreach_instr_global(ctx, I) {
+      if (I->op != BI_OPCODE_COLLECT_I32 || I->nr_srcs < 2 ||
+          I->dest[0].value >= first_reg || I->dest[0].memory)
+         continue;
+
+      bi_foreach_src(I, i) {
+         const bi_index s = I->src[i];
+         if (!bi_is_ssa(s) || s.value >= first_reg || s.offset || s.abs ||
+             s.neg || s.memory || s.swizzle != BI_SWIZZLE_H01 ||
+             !def[s.value] || BITSET_TEST(skip, s.value))
+            continue;
+
+         rename[s.value] = I->dest[0];
+         rename[s.value].offset = i;
+         BITSET_SET(skip, s.value);
+         I->src[i] = bi_null();
+         any = true;
+      }
+   }
+
+   if (any) {
+      bi_foreach_instr_global(ctx, I) {
+         bi_foreach_dest(I, d) {
+            const unsigned v = I->dest[d].value;
+            if (I->dest[d].type == BI_INDEX_NORMAL && v < first_reg &&
+                !bi_is_null(rename[v])) {
+               I->dest[d].value = rename[v].value;
+               I->dest[d].offset = rename[v].offset;
+            }
+         }
+
+         bi_foreach_ssa_src(I, s) {
+            const unsigned v = I->src[s].value;
+            if (v < first_reg && !bi_is_null(rename[v])) {
+               I->src[s].value = rename[v].value;
+               I->src[s].offset += rename[v].offset;
+            }
+         }
+      }
+   }
+
+   free(rename);
+   free(skip);
+   free(def);
+   return any;
+}
+
+/* The instructions of every block, kept so RA can start over from them */
+struct bi_ra_snapshot {
+   void *mem;
+   bi_instr **instrs;
+   unsigned *count;
+   unsigned ssa_alloc;
+};
+
+static bi_instr *
+bi_ra_clone_instr(void *mem, const bi_instr *I)
+{
+   bi_instr *n = ralloc_size(
+      mem, sizeof(bi_instr) + sizeof(bi_index) * (I->nr_dests + I->nr_srcs));
+
+   *n = *I;
+   n->dest = (bi_index *)&n[1];
+   n->src = n->dest + I->nr_dests;
+   memcpy(n->dest, I->dest, sizeof(bi_index) * I->nr_dests);
+   memcpy(n->src, I->src, sizeof(bi_index) * I->nr_srcs);
+   return n;
+}
+
+static void
+bi_ra_save(bi_context *ctx, struct bi_ra_snapshot *s)
+{
+   unsigned nr = 0, b = 0;
+
+   bi_foreach_block(ctx, block) {
+      b++;
+      bi_foreach_instr_in_block(block, I)
+         nr++;
+   }
+
+   s->mem = ralloc_context(NULL);
+   s->instrs = ralloc_array(s->mem, bi_instr *, nr);
+   s->count = rzalloc_array(s->mem, unsigned, b);
+   s->ssa_alloc = ctx->ssa_alloc;
+
+   nr = 0;
+   b = 0;
+   bi_foreach_block(ctx, block) {
+      bi_foreach_instr_in_block(block, I) {
+         s->instrs[nr++] = bi_ra_clone_instr(s->mem, I);
+         s->count[b]++;
+      }
+      b++;
+   }
+}
+
+static void
+bi_ra_restore(bi_context *ctx, const struct bi_ra_snapshot *s)
+{
+   unsigned nr = 0, b = 0;
+
+   bi_foreach_block(ctx, block) {
+      list_inithead(&block->instructions);
+      for (unsigned i = 0; i < s->count[b]; ++i) {
+         bi_instr *I = bi_ra_clone_instr(ctx, s->instrs[nr++]);
+         list_addtail(&I->link, &block->instructions);
+      }
+      b++;
+   }
+
+   ctx->ssa_alloc = s->ssa_alloc;
+}
+
 /*
  * Check if the instruction requires a "tied" operand. Such instructions MUST
  * allocate their source and destination to the same register. This is a
@@ -1262,6 +1426,15 @@ compute_spill_cost(bi_context *ctx)
    ralloc_free(mctx);
 }
 
+/* Lower tied operands. SSA is broken from here on. */
+static void
+bi_ra_lower(bi_context *ctx, unsigned first_reg)
+{
+   bi_lower_vector(ctx, first_reg);
+   bi_coalesce_tied(ctx);
+   squeeze_index(ctx);
+}
+
 void
 bi_register_allocate(bi_context *ctx)
 {
@@ -1313,15 +1486,29 @@ bi_register_allocate(bi_context *ctx)
       }
    }
 
-   /* Lower tied operands. SSA is broken from here on. */
    unsigned first_reg = bi_out_of_ssa(ctx);
-   bi_lower_vector(ctx, first_reg);
-   bi_coalesce_tied(ctx);
-   squeeze_index(ctx);
+   struct bi_ra_snapshot plain, coalesced;
 
-   /* Try with reduced register pressure to improve thread count */
+   bi_ra_save(ctx, &plain);
+   const bool coalesce = bi_coalesce_collects(ctx, first_reg);
+   bi_ra_lower(ctx, first_reg);
+   if (coalesce)
+      bi_ra_save(ctx, &coalesced);
+
+   /* Try with reduced register pressure to improve thread count. Coalesced
+    * collects are only worth it if they keep the thread count and do not
+    * spill: fall back to the plain moves first at 32 registers, then at the
+    * full register file.
+    */
    if (ctx->arch >= 7) {
       l = bi_allocate_registers(ctx, &success, false);
+
+      if (!success && coalesce) {
+         lcra_free(l);
+         bi_ra_restore(ctx, &plain);
+         bi_ra_lower(ctx, first_reg);
+         l = bi_allocate_registers(ctx, &success, false);
+      }
 
       if (success) {
          ctx->info.work_reg_count = 32;
@@ -1330,6 +1517,24 @@ bi_register_allocate(bi_context *ctx)
          l = NULL;
       }
    }
+
+   if (!success && coalesce) {
+      bi_ra_restore(ctx, &coalesced);
+      l = bi_allocate_registers(ctx, &success, true);
+
+      if (success) {
+         ctx->info.work_reg_count = BI_MAX_REGS;
+      } else {
+         lcra_free(l);
+         l = NULL;
+         bi_ra_restore(ctx, &plain);
+         bi_ra_lower(ctx, first_reg);
+      }
+   }
+
+   ralloc_free(plain.mem);
+   if (coalesce)
+      ralloc_free(coalesced.mem);
 
    /* Otherwise, use the register file and spill until we succeed */
    while (!success && ((iter_count++) < max_iters)) {

@@ -1135,6 +1135,17 @@ if with_platform_android
         xclipse_gralloc / 'libs-a12' / 'android.hardware.graphics.mapper@4.0.so',
       ],
     )
+    # libui's GraphicBufferMapper picks the device's mapper itself: IMapper5 (stable-C,
+    # Android 15+, no HIDL service at all on Android 17) down to 2.0. Linked against the
+    # Android 12 libui, which already exports every getter u_gralloc_imapper5_api.cpp calls.
+    dep_android_ui = declare_dependency(
+      compile_args : ['-I' + xclipse_gralloc / 'include'],
+      link_args : [
+        '-L' + xclipse_gralloc / 'libs-a12',
+        '-lui', '-lutils', '-lcutils', '-lnativewindow', '-llog',
+        xclipse_gralloc / 'libs-a12' / 'libc++.so',
+      ],
+    )
   endif
   if not with_android_stub
     dep_android = [

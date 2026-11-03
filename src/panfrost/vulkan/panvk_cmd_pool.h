@@ -15,6 +15,9 @@ struct panvk_cmd_pool {
    struct panvk_bo_pool cs_bo_pool;
    struct panvk_bo_pool desc_bo_pool;
    struct panvk_bo_pool varying_bo_pool;
+   /* Varying buffers over a slab (instanced draws), kept for reuse rather than made and freed
+    * per draw. */
+   struct panvk_bo_pool varying_big_bo_pool;
    struct panvk_bo_pool tls_bo_pool;
    struct panvk_bo_pool tls_big_bo_pool;
    struct list_head push_sets;

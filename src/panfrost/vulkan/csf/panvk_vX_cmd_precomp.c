@@ -31,6 +31,8 @@ panvk_per_arch(dispatch_precomp)(struct panvk_precomp_ctx *ctx,
 
 
    struct panvk_cmd_buffer *cmdbuf = ctx->cmdbuf;
+   const enum panvk_subqueue_id subq =
+      ctx->on_vt ? PANVK_SUBQUEUE_VERTEX_TILER : PANVK_SUBQUEUE_COMPUTE;
    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
    struct panvk_physical_device *phys_dev =
       to_panvk_physical_device(dev->vk.physical);
@@ -60,9 +62,9 @@ panvk_per_arch(dispatch_precomp)(struct panvk_precomp_ctx *ctx,
       cmdbuf, shader, &dim, grid.csf.dynamic_count);
    assert(tsd);
 
-   struct cs_builder *b = panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_COMPUTE);
+   struct cs_builder *b = panvk_get_cs_builder(cmdbuf, subq);
    const struct cs_tracing_ctx *tracing_ctx =
-      &cmdbuf->state.cs[PANVK_SUBQUEUE_COMPUTE].tracing;
+      &cmdbuf->state.cs[subq].tracing;
 
    /* Copy the global TLS pointer and size to the per-job TSD. */
    if (shader->info.tls_size) {
@@ -146,7 +148,7 @@ panvk_per_arch(dispatch_precomp)(struct panvk_precomp_ctx *ctx,
       }
    }
 
-   cs_next_iter_sb(cmdbuf, PANVK_SUBQUEUE_COMPUTE,
+   cs_next_iter_sb(cmdbuf, subq,
                    cs_scratch_reg_tuple(b, 0, 2));
 
    unsigned task_axis = MALI_TASK_AXIS_X;
@@ -167,6 +169,12 @@ panvk_per_arch(dispatch_precomp)(struct panvk_precomp_ctx *ctx,
    }
    cs_trace_run_compute(b, tracing_ctx, cs_scratch_reg_tuple(b, 0, 4),
                         task_increment, task_axis, PANVK_PRECOMP_RES_SEL);
+
+   if (ctx->on_vt) {
+      /* Whatever follows on this queue consumes the result. */
+      cs_wait_slots(b, dev->csf.sb.all_iters_mask);
+      return;
+   }
 
    if (barrier & PANLIB_BARRIER_CSF_SYNC)
       panvk_per_arch(cmd_signal_barrier)(cmdbuf, PANVK_CSF_BARRIER_SYNC);

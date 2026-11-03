@@ -516,6 +516,7 @@ panvk_image_init_layouts(struct panvk_image *image,
             .offset_B = explicit_info->pPlaneLayouts[plane].offset,
             .wsi_row_pitch_B = explicit_info->pPlaneLayouts[plane].rowPitch,
             .wsi_array_pitch_B = explicit_info->pPlaneLayouts[plane].arrayPitch,
+            .wsi_plane_size_B = explicit_info->pPlaneLayouts[plane].size,
             .strict = use_strict_import,
          };
       }
@@ -935,6 +936,13 @@ panvk_DestroyImage(VkDevice _device, VkImage _image,
       panvk_image_report_binding(device, image,
                                  VK_DEVICE_ADDRESS_BINDING_TYPE_UNBIND_EXT);
    }
+
+   util_dynarray_foreach(&image->heap_payloads.entries,
+                         struct panvk_heap_payload, p) {
+      panvk_pool_free_mem(&p->mem);
+      free(p->data);
+   }
+   util_dynarray_fini(&image->heap_payloads.entries);
 
    vk_image_destroy(&device->vk, pAllocator, &image->vk);
 }

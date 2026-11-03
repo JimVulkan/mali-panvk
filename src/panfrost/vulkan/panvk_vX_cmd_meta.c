@@ -632,7 +632,6 @@ bc_emu_transcode(struct panvk_cmd_buffer *cmdbuf, struct panvk_image *img,
    bc_emu_barrier(cmdbuf);
 }
 
-#if PAN_ARCH < 10
 /* Every mip level, layer and slice of a linear image, from what its plane 0 holds now. */
 static void
 bc_emu_refresh_image(struct panvk_cmd_buffer *cmdbuf, struct panvk_image *img)
@@ -682,13 +681,14 @@ panvk_per_arch(bc_emu_refresh_begin)(struct panvk_device *dev)
       }
    }
 
-   VkCommandBuffer cmd = st->refresh[st->refresh_next];
-   st->refresh_next = (st->refresh_next + 1) % ARRAY_SIZE(st->refresh);
+   const unsigned slot = st->refresh_next;
+   VkCommandBuffer cmd = st->refresh[slot];
+   st->refresh_next = (slot + 1) % ARRAY_SIZE(st->refresh);
+   st->refresh_cur = slot;
    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, cmd);
 
    /* The ring slot's last run, four submissions ago, before it is reset. */
-   if (cmdbuf->kbase_seq)
-      pan_kmod_kbase_wait_seq(dev->kmod.dev, cmdbuf->kbase_seq);
+   panvk_bc_emu_wait(dev, st->refresh_group[slot], st->refresh_seq[slot]);
    disp->ResetCommandBuffer(cmd, 0);
    const VkCommandBufferBeginInfo bi = {
       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -709,18 +709,23 @@ none:
 
 void
 panvk_per_arch(bc_emu_refresh_end)(struct panvk_device *dev, struct panvk_cmd_buffer *cmdbuf,
-                                   uint64_t seq)
+                                   struct pan_kmod_kbase_csf_group *group, uint64_t seq)
 {
    struct panvk_bc_emu_state *st = &dev->bc_emu;
 
    if (seq) {
+#if PAN_ARCH < 10
       cmdbuf->kbase_seq = seq;
-      list_for_each_entry(struct panvk_image, img, &st->linear_images, bc_emu.link)
+#endif
+      st->refresh_group[st->refresh_cur] = group;
+      st->refresh_seq[st->refresh_cur] = seq;
+      list_for_each_entry(struct panvk_image, img, &st->linear_images, bc_emu.link) {
+         img->bc_emu.group = group;
          img->bc_emu.seq = seq;
+      }
    }
    simple_mtx_unlock(&st->linear_lock);
 }
-#endif
 
 VKAPI_ATTR void VKAPI_CALL
 panvk_per_arch(CmdCopyMemoryToImageKHR)(

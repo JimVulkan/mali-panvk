@@ -39,6 +39,14 @@
  * of 16 sets, but we reserve 9 for our internal use, so we have 7 left. */
 #define MAX_SETS 7
 
+/* VK_EXT_descriptor_heap resource table entries, after the driver set (0)
+ * and the descriptor sets (1..MAX_SETS). A heap byte offset is a descriptor
+ * index times PANVK_DESCRIPTOR_SIZE inside the table. */
+#define PANVK_HEAP_RESOURCE_TABLE (MAX_SETS + 1)
+#define PANVK_HEAP_SAMPLER_TABLE  (MAX_SETS + 2)
+#define PANVK_HEAP_EMBEDDED_TABLE (MAX_SETS + 3)
+#define PANVK_HEAP_TABLE_END      (MAX_SETS + 4)
+
 #if PAN_ARCH < 9
 
 /* MALI_RENDERER_STATE::sampler_count is 16-bit. */

@@ -875,7 +875,7 @@ panlib_gs_restart_unroll(global VkDrawIndexedIndirectCommand *cmd, global uint8_
 
 #endif
 
-#if PAN_ARCH >= 6 && PAN_ARCH <= 9
+#if PAN_ARCH >= 6
 /* Transform feedback. The geometry shader emulation left, per invocation, how many complete
  * primitives it emitted and a staging record for every vertex slot. Capture order is draw order,
  * which is invocation order, so one thread turns the counts into each invocation's first
@@ -892,7 +892,7 @@ panlib_xfb_scan(global struct libpan_xfb_draw *d)
    uint32_t total = 0;
    for (uint32_t i = 0; i < d->invocations; i++) {
       first[i] = total;
-      total += counts[i];
+      total += counts[i * max(d->count_stride, 1u)];
    }
 
    uint32_t fit = total;
@@ -910,6 +910,13 @@ panlib_xfb_scan(global struct libpan_xfb_draw *d)
 
    d->written = fit;
    d->needed = total;
+
+   /* An active transform feedback stream query on this stream. */
+   global uint64_t *stats = (global uint64_t *)d->stats;
+   if (stats) {
+      stats[0] += fit;
+      stats[1] += total;
+   }
 }
 
 /* One thread per emulation invocation: its primitives' vertices, record dword by record dword,
@@ -926,7 +933,8 @@ panlib_xfb_copy(global struct libpan_xfb_draw *d)
    if (p0 >= written)
       return;
 
-   const uint32_t n = min(((global uint32_t *)d->counts)[inv], written - p0);
+   const uint32_t n =
+      min(((global uint32_t *)d->counts)[inv * max(d->count_stride, 1u)], written - p0);
    const uint32_t vpp = d->vpp;
    const uint32_t k_dw = d->record_dwords;
    global uint32_t *idx = (global uint32_t *)d->indices + (uint64_t)inv * d->idx_per_invocation;
@@ -967,6 +975,70 @@ panlib_xfb_counters(global uint32_t *offsets, uint64_t c0, uint64_t c1, uint64_t
       else if (counter)
          *counter = offsets[b];
    }
+}
+
+/* vkCmdEndQuery of a transform feedback stream query: the two totals into the report, then
+ * availability. */
+KERNEL(1)
+panlib_xfb_query_end(global uint64_t *stats, global uint64_t *report, global uint32_t *available)
+{
+   report[0] = stats[0];
+   report[1] = stats[1];
+   *available = 1;
+}
+
+/* vkCmdDrawIndirectByteCountEXT: the vertex count from the bytes the counter says were
+ * captured. */
+KERNEL(1)
+panlib_xfb_byte_count(global uint32_t *counter, global uint32_t *cmd, uint32_t counter_offset,
+                      uint32_t vertex_stride)
+{
+   const uint32_t bytes = *counter;
+   cmd[0] = bytes > counter_offset ? (bytes - counter_offset) / vertex_stride : 0;
+}
+#endif
+
+#if PAN_ARCH >= 9
+/* An indirect draw through the geometry shader emulation: the vertex job's size from the
+ * command, cut to the records allocated, and the same cut into the command the emulation reads,
+ * so it never looks past what the vertex job wrote. Records are laid out per instance at a
+ * padded stride, the encoding the emulation decodes from the DRAW word. */
+KERNEL(1)
+panlib_gs_indirect_setup(global struct libpan_gs_indirect *d)
+{
+   global uint32_t *cmd = (global uint32_t *)d->cmd;
+   const uint32_t n_cmd = cmd[0];
+   uint32_t inst = cmd[1];
+   if (d->count && d->draw >= *(global uint32_t *)d->count)
+      inst = 0;
+
+   const uint32_t n = d->indexed ? n_cmd : min(n_cmd, d->max_vertices);
+   const uint32_t x = max(d->indexed ? d->index_records : n, 1u);
+   const uint32_t stride = pan_padded_vertex_count(x);
+   inst = min(inst, d->records / stride);
+
+   const uint32_t first_vertex = d->indexed ? cmd[3] : cmd[2];
+   const uint32_t first_instance = d->indexed ? cmd[4] : cmd[3];
+
+   d->job_x = x;
+   d->job_y = max(inst, 1u);
+   d->attrib_offset = first_vertex;
+   const uint32_t shift = __builtin_ctz(stride);
+   d->dcd = ((((stride >> shift) - 1) / 2) << 5 | shift) << 16;
+   d->out_cmd[0] = n;
+   d->out_cmd[1] = inst;
+   d->out_cmd[2] = cmd[2];
+   d->out_cmd[3] = cmd[3];
+   d->out_cmd[4] = d->indexed ? cmd[4] : 0;
+   d->zero = 0;
+
+   global uint8_t *fau = (global uint8_t *)d->fau;
+   if (d->first_vertex_off != ~0u)
+      *(global uint32_t *)(fau + d->first_vertex_off) = first_vertex;
+   if (d->base_instance_off != ~0u)
+      *(global uint32_t *)(fau + d->base_instance_off) = first_instance;
+   if (d->stride_off != ~0u)
+      *(global uint32_t *)(fau + d->stride_off) = stride;
 }
 #endif
 
@@ -1029,6 +1101,32 @@ panlib_v9_draw_indirect(global struct libpan_v9_indirect_draw *d)
       for (uint32_t i = 0; i < 16; i++) {
          if (d->patch_attribs & (1u << i))
             attribs[i * 8 + 2] += first_instance * d->strides[i];
+      }
+   }
+}
+
+/* Compute Payload words 2 and 3 are the workgroup counts X and Y, word 8 the shader
+ * environment's attribute offset (v9.xml). */
+KERNEL(1)
+panlib_v9_gs_job(global struct libpan_v9_gs_job *j)
+{
+   global const struct libpan_gs_indirect *d = (global const struct libpan_gs_indirect *)j->dims;
+   global uint32_t *payload =
+      (global uint32_t *)((global uint8_t *)j->job + pan_section_offset(COMPUTE_JOB, PAYLOAD));
+
+   payload[2] = d->job_x;
+   payload[3] = d->job_y;
+   payload[8] = d->attrib_offset;
+
+   if (!j->cmd)
+      return;
+   global const uint32_t *cmd = (global const uint32_t *)j->cmd;
+   const uint32_t first_instance = j->indexed ? cmd[4] : cmd[3];
+   if (first_instance) {
+      global uint32_t *attribs = (global uint32_t *)j->attribs;
+      for (uint32_t i = 0; i < 16; i++) {
+         if (j->patch_attribs & (1u << i))
+            attribs[i * 8 + 2] += first_instance * j->strides[i];
       }
    }
 }

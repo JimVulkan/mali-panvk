@@ -130,6 +130,7 @@ prepare_tex_descs(struct panvk_image_view *view)
 #endif
 
    view->mem = panvk_pool_alloc_mem(&dev->mempools.rw, alloc_info);
+   view->mem_size = alloc_info.size;
    if (!panvk_priv_mem_check_alloc(view->mem))
       return panvk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 

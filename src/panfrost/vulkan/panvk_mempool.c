@@ -268,11 +268,20 @@ panvk_pool_flush_maps(struct panvk_pool *pool)
    if (!(pool->props.create_flags & PAN_KMOD_BO_FLAG_WB_MMAP))
       return;
 
+   /* Allocations only ever grow transient_offset in the transient BO, so
+    * nothing past it was written. Cleaning the whole 64K slab line by line
+    * was most of the fixed cost of a small command buffer (~20 us each on
+    * the Tab S11).
+    */
    list_for_each_entry(struct panvk_priv_bo, bo, &pool->bos, node)
-      panvk_priv_bo_flush(bo, 0, bo->bo->size);
+      panvk_priv_bo_flush(bo, 0,
+                          bo == pool->transient_bo ? pool->transient_offset
+                                                   : bo->bo->size);
 
    list_for_each_entry(struct panvk_priv_bo, bo, &pool->big_bos, node)
-      panvk_priv_bo_flush(bo, 0, bo->bo->size);
+      panvk_priv_bo_flush(bo, 0,
+                          bo == pool->transient_bo ? pool->transient_offset
+                                                   : bo->bo->size);
 }
 
 void

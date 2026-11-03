@@ -68,7 +68,18 @@ struct panvk_descriptor_state {
 
    uint32_t dyn_buf_offsets[MAX_SETS][MAX_DYNAMIC_BUFFERS];
    uint32_t dyn_ssbos[MAX_SETS];
+
+#if PAN_ARCH >= 9
+   /* VK_EXT_descriptor_heap, indexed by PANVK_HEAP_RESOURCE/SAMPLER. */
+   struct {
+      uint64_t addr;
+      uint64_t size;
+   } heaps[2];
+#endif
 };
+
+#define PANVK_HEAP_RESOURCE 0
+#define PANVK_HEAP_SAMPLER  1
 
 #if PAN_ARCH < 9
 VkResult panvk_per_arch(cmd_prepare_dyn_ssbos)(
@@ -99,5 +110,14 @@ VkResult panvk_per_arch(cmd_prepare_shader_res_table)(
 VkResult panvk_per_arch(cmd_prepare_push_descs)(
    struct panvk_cmd_buffer *cmdbuf, struct panvk_descriptor_state *desc_state,
    uint32_t used_set_mask);
+
+#if PAN_ARCH >= 9
+void panvk_per_arch(cmd_bind_desc_heap)(struct panvk_cmd_buffer *cmdbuf,
+                                        uint32_t heap,
+                                        const VkBindHeapInfoEXT *info);
+
+void panvk_per_arch(cmd_inherit_desc_heaps)(
+   struct panvk_cmd_buffer *cmdbuf, const VkCommandBufferBeginInfo *info);
+#endif
 
 #endif

@@ -10,10 +10,14 @@
 #include "util/format/u_format.h"
 
 #include "util/list.h"
+#include "util/simple_mtx.h"
+#include "util/u_dynarray.h"
 #include "vk_format.h"
 #include "vk_image.h"
 
 #include "pan_image.h"
+
+#include "panvk_mempool.h"
 
 #define PANVK_MAX_PLANES 3
 
@@ -55,8 +59,24 @@ struct panvk_image {
       bool linear_sampled;
       bool listed;
       struct list_head link;
+      /* CSF: the queue group seq belongs to; NULL on JM. */
+      struct pan_kmod_kbase_csf_group *group;
       uint64_t seq;
    } bc_emu;
+
+   /* Texture payloads that descriptor heap image descriptors point at
+    * (VK_EXT_descriptor_heap has no view object to own them), deduplicated
+    * by content and freed with the image. */
+   struct {
+      simple_mtx_t lock;
+      struct util_dynarray entries; /* struct panvk_heap_payload */
+   } heap_payloads;
+};
+
+struct panvk_heap_payload {
+   void *data;
+   uint32_t size;
+   struct panvk_priv_mem mem;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(panvk_image, vk.base, VkImage,

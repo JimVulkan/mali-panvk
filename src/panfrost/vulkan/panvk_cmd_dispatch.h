@@ -87,6 +87,20 @@ struct panvk_dispatch_info {
 #endif
 };
 
+/* Adds a direct dispatch to an active pipeline statistics query (compute shader invocations,
+ * see panvk_pipeline_stats_state). */
+#define panvk_stats_add_dispatch(__cmdbuf, __cs, __info)                       \
+   do {                                                                        \
+      if ((__cmdbuf)->state.gfx.stats.active &&                                \
+          !(__info)->indirect.buffer_dev_addr) {                               \
+         (__cmdbuf)->state.gfx.stats.counts[10] +=                             \
+            (uint64_t)(__info)->direct.wg_count.x *                            \
+            (__info)->direct.wg_count.y * (__info)->direct.wg_count.z *        \
+            (__cs)->cs.local_size.x * (__cs)->cs.local_size.y *                \
+            (__cs)->cs.local_size.z;                                           \
+      }                                                                        \
+   } while (0)
+
 void panvk_per_arch(cmd_prepare_dispatch_sysvals)(
    struct panvk_cmd_buffer *cmdbuf, const struct panvk_dispatch_info *info);
 

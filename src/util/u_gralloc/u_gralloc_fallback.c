@@ -233,10 +233,17 @@ fallback_gralloc_get_yuv_info(struct u_gralloc *gralloc,
  * prefix, magic at data[21], and has 6 more ints before plane_info. So the magic is searched for,
  * and the plane-0 {byte stride, width, height} triple is taken from the first known offset where
  * it is consistent with the buffer. */
-#define ARM_HND_WIDTH            2
-#define ARM_HND_HEIGHT           3
-#define ARM_HND_REQ_FORMAT       4
-static const int arm_hnd_plane0[] = {15 /* Exynos */, 21 /* MediaTek */};
+/* MediaTek's allocator on Android 17 (Galaxy Tab S12+, MT6993) moved both again: magic still at
+ * data[21], the requested width, height and format one int earlier, plane_info at magic+16. */
+struct arm_hnd_layout {
+   int plane0, width, height, req_format;
+};
+static const struct arm_hnd_layout arm_hnd_layouts[] = {
+   {15, 2, 3, 4}, /* Exynos */
+   {21, 2, 3, 4}, /* MediaTek */
+   {16, 1, 2, 3}, /* MediaTek, Android 17 */
+};
+enum { ARM_HND_EXYNOS, ARM_HND_MTK, ARM_HND_MTK2 };
 /* The u64 alloc format (HAL format low, AFBC and other layout bits from 32) sits 5 ints before
  * plane_info on both: magic+10 on Exynos, magic+16 on MediaTek. */
 #define ARM_HND_ALLOC_FORMAT_BACK 5
@@ -262,6 +269,13 @@ static const int arm_hnd_plane0[] = {15 /* Exynos */, 21 /* MediaTek */};
  * passes both directions, with YUV transform every pixel is wrong. A BGRA 8888 buffer is stored in
  * RGBA component order here too (alloc format 0x1_00000005), as the vendor driver reports it. */
 #define ARM_EXYNOS_AFBC_ALLOC_BITS 0x1u
+/* MediaTek's allocator on Android 17 (Tab S12+) no longer sets bit 32 on AFBC buffers. Its
+ * IMapper5 reports the modifier of the two alloc formats GPU-only buffers get: 0x0c410000_<hal>
+ * (usage 0x300, 0xa00) is 16x16 tiled, YUV transform, sparse, solid color; 0x0c310000_<hal>
+ * (usage 0xb00) is 32x8 split, YUV transform, sparse. Both checked against the vendor GLES driver
+ * with probe/mali/vkafbc.c at 32x16 to 1920x1080. CPU-usage buffers have alloc format 0. */
+#define ARM_MTK2_AFBC_16X16_BITS 0x0c410000u
+#define ARM_MTK2_AFBC_32X8_BITS  0x0c310000u
 
 /* Returns -ENOENT when the handle is not an ARM gralloc handle. */
 static int
@@ -281,20 +295,23 @@ arm_gralloc_get_buffer_info(struct u_gralloc_buffer_handle *hnd,
       return -ENOENT;
 
    const int *h = &handle->data[m];
-   const int format = h[ARM_HND_REQ_FORMAT];
-   const uint32_t width = h[ARM_HND_WIDTH];
-   const uint32_t height = h[ARM_HND_HEIGHT];
-   const uint32_t bpp = get_hal_format_bpp(format);
-
-   int plane0 = -1;
-   for (unsigned i = 0; i < ARRAY_SIZE(arm_hnd_plane0) && plane0 < 0; i++) {
-      const int o = arm_hnd_plane0[i];
+   int format = 0, layout = -1, plane0 = -1;
+   uint32_t width = 0, height = 0, bpp = 0;
+   for (unsigned i = 0; i < ARRAY_SIZE(arm_hnd_layouts) && plane0 < 0; i++) {
+      const struct arm_hnd_layout *l = &arm_hnd_layouts[i];
+      const int o = l->plane0;
       if (m + o + 2 * ARM_HND_PLANE_INTS > total)
          continue;
+      format = h[l->req_format];
+      width = h[l->width];
+      height = h[l->height];
+      bpp = get_hal_format_bpp(format);
       const uint32_t ps = h[o], pw = h[o + 1], ph = h[o + 2];
       if (bpp && width && ps >= width * bpp && ps <= INT32_MAX && pw >= width && ph >= height &&
-          ps >= pw * bpp)
+          ps >= pw * bpp) {
          plane0 = o;
+         layout = i;
+      }
    }
    if (plane0 < 0) {
       /* An ARM handle of a layout not measured here (another allocator version: a Helio G90's
@@ -343,16 +360,33 @@ arm_gralloc_get_buffer_info(struct u_gralloc_buffer_handle *hnd,
     * AHardwareBuffers avoid AFBC by asking for MALI_GRALLOC_USAGE_NO_AFBC and composer usage. */
    uint64_t modifier = DRM_FORMAT_MOD_LINEAR;
    int stored_format = format;
-   if (alloc_format & ARM_ALLOC_FORMAT_AFBC) {
-      const uint32_t alloc_hal = (uint32_t)alloc_format;
-      const bool mtk_afbc = plane0 == arm_hnd_plane0[1] &&
+   const uint32_t alloc_hal = (uint32_t)alloc_format;
+   const bool mtk2_afbc = layout == ARM_HND_MTK2 &&
+                          ((alloc_format >> 32) == ARM_MTK2_AFBC_16X16_BITS ||
+                           (alloc_format >> 32) == ARM_MTK2_AFBC_32X8_BITS) &&
+                          ((alloc_hal == (uint32_t)format &&
+                            (format == HAL_PIXEL_FORMAT_RGBA_8888 ||
+                             format == HAL_PIXEL_FORMAT_RGBX_8888)) ||
+                           (alloc_hal == HAL_PIXEL_FORMAT_RGBA_8888 &&
+                            format == HAL_PIXEL_FORMAT_BGRA_8888));
+   if (mtk2_afbc) {
+      modifier = (alloc_format >> 32) == ARM_MTK2_AFBC_16X16_BITS
+                    ? DRM_FORMAT_MOD_ARM_AFBC(AFBC_FORMAT_MOD_BLOCK_SIZE_16x16 |
+                                              AFBC_FORMAT_MOD_TILED | AFBC_FORMAT_MOD_YTR |
+                                              AFBC_FORMAT_MOD_SPARSE | AFBC_FORMAT_MOD_SC)
+                    : DRM_FORMAT_MOD_ARM_AFBC(AFBC_FORMAT_MOD_BLOCK_SIZE_32x8 |
+                                              AFBC_FORMAT_MOD_YTR | AFBC_FORMAT_MOD_SPLIT |
+                                              AFBC_FORMAT_MOD_SPARSE);
+      stored_format = alloc_hal;
+   } else if (alloc_format & ARM_ALLOC_FORMAT_AFBC) {
+      const bool mtk_afbc = layout == ARM_HND_MTK &&
                             (alloc_format >> 32) == ARM_MTK_AFBC_ALLOC_BITS &&
                             ((alloc_hal == (uint32_t)format &&
                               (format == HAL_PIXEL_FORMAT_RGBA_8888 ||
                                format == HAL_PIXEL_FORMAT_RGBX_8888)) ||
                              (alloc_hal == HAL_PIXEL_FORMAT_RGBA_8888 &&
                               format == HAL_PIXEL_FORMAT_BGRA_8888));
-      const bool exy_afbc = plane0 == arm_hnd_plane0[0] &&
+      const bool exy_afbc = layout == ARM_HND_EXYNOS &&
                             (alloc_format >> 32) == ARM_EXYNOS_AFBC_ALLOC_BITS &&
                             alloc_hal == (uint32_t)format &&
                             (format == HAL_PIXEL_FORMAT_RGBA_8888 ||
@@ -386,11 +420,14 @@ arm_gralloc_get_buffer_info(struct u_gralloc_buffer_handle *hnd,
    /* The buffer's dma-buf: the first fd big enough to hold it. Exynos puts it first; MediaTek's
     * handle carries 3 fds and the first is not one (lseek gives no size). */
    int fd = -1;
+   off_t fd_size = 0;
    for (int i = 0; i < handle->numFds && fd < 0; i++) {
       const off_t sz = lseek(handle->data[i], 0, SEEK_END);
       lseek(handle->data[i], 0, SEEK_SET);
-      if (sz > 0 && (uint64_t)sz >= (uint64_t)stride * height)
+      if (sz > 0 && (uint64_t)sz >= (uint64_t)stride * height) {
          fd = handle->data[i];
+         fd_size = sz;
+      }
    }
    if (fd < 0) {
       mesa_loge("ARM gralloc: no fd of the handle holds %u bytes", stride * height);
@@ -403,6 +440,9 @@ arm_gralloc_get_buffer_info(struct u_gralloc_buffer_handle *hnd,
    out->fds[0] = fd;
    out->offsets[0] = 0;
    out->strides[0] = stride;
+   /* The whole dma-buf: an AFBC import bounds its plane by it, since the allocator's body can
+    * sit further out than the driver's own layout puts it. */
+   out->alloc_size = fd_size;
 
    return 0;
 }

@@ -15,6 +15,8 @@
 #include <ui/GraphicBufferMapper.h>
 
 #include <system/window.h>
+#include <string.h>
+#include <unistd.h>
 
 #include "util/log.h"
 #include "u_gralloc_internal.h"
@@ -44,14 +46,25 @@ GetPlaneLayouts(const native_handle_t *buffer)
 
 struct gralloc_mapper {
    struct u_gralloc base;
+   /* XCLIPSE: handles the mapper cannot describe go to the handle parsers instead. */
+   struct u_gralloc *fallback;
 };
 
 extern "C" {
 
+/* Whether fd is something with a size (a dma-buf), leaving its offset at 0. */
+static bool
+mapper5_fd_has_size(int fd)
+{
+   const off_t sz = lseek(fd, 0, SEEK_END);
+   lseek(fd, 0, SEEK_SET);
+   return sz > 0;
+}
+
 static int
-mapper5_get_buffer_basic_info(struct u_gralloc *gralloc,
-                              struct u_gralloc_buffer_handle *hnd,
-                              struct u_gralloc_buffer_basic_info *out)
+mapper5_query_buffer_basic_info(struct u_gralloc *gralloc,
+                                struct u_gralloc_buffer_handle *hnd,
+                                struct u_gralloc_buffer_basic_info *out)
 {
    if (!hnd->handle)
       return -EINVAL;
@@ -92,6 +105,27 @@ mapper5_get_buffer_basic_info(struct u_gralloc *gralloc,
 
    int fd_index = 0;
 
+   /* XCLIPSE: some gralloc4 implementations (Samsung's) leave strideInBytes at 0 on linear
+    * buffers while every other field is right. Rebuild it from the plane's width and component
+    * sizes, or from its total size when it is the only plane. */
+   for (uint32_t i = 0; i < layouts.size(); i++) {
+      if (layouts[i].strideInBytes != 0)
+         continue;
+
+      int64_t bits = 0;
+      for (const auto &comp : layouts[i].components)
+         bits += comp.sizeInBits;
+
+      int64_t stride = 0;
+      if (bits > 0 && bits % 8 == 0 && layouts[i].widthInSamples > 0)
+         stride = layouts[i].widthInSamples * (bits / 8);
+      else if (layouts.size() == 1 && layouts[i].heightInSamples > 0)
+         stride = layouts[i].totalSizeInBytes / layouts[i].heightInSamples;
+      if (stride <= 0)
+         return -EINVAL;
+      layouts[i].strideInBytes = stride;
+   }
+
    for (uint32_t i = 0; i < layouts.size(); i++) {
       out->strides[i] = layouts[i].strideInBytes;
       out->offsets[i] = layouts[i].offsetInBytes;
@@ -103,10 +137,33 @@ mapper5_get_buffer_basic_info(struct u_gralloc *gralloc,
       if (fd_index >= hnd->handle->numFds)
          return -EINVAL;
 
+      /* XCLIPSE: MediaTek's ARM gralloc puts a -1 fd ahead of the buffer's, or (Dimensity 9300,
+       * Android 15) an fd that is not a dma-buf at all: lseek gives it no size. Skip both. */
+      while (fd_index < hnd->handle->numFds &&
+             (hnd->handle->data[fd_index] < 0 || !mapper5_fd_has_size(hnd->handle->data[fd_index])))
+         fd_index++;
+      if (fd_index >= hnd->handle->numFds)
+         return -EINVAL;
+
       out->fds[i] = hnd->handle->data[fd_index];
    }
 
    return 0;
+}
+
+static int
+mapper5_get_buffer_basic_info(struct u_gralloc *gralloc,
+                              struct u_gralloc_buffer_handle *hnd,
+                              struct u_gralloc_buffer_basic_info *out)
+{
+   gralloc_mapper *gr = (gralloc_mapper *)gralloc;
+
+   int ret = mapper5_query_buffer_basic_info(gralloc, hnd, out);
+   if (ret == 0 || !gr->fallback || !hnd->handle)
+      return ret;
+
+   memset(out, 0, sizeof(*out));
+   return gr->fallback->ops.get_buffer_basic_info(gr->fallback, hnd, out);
 }
 
 static int
@@ -203,6 +260,8 @@ static int
 destroy(struct u_gralloc *gralloc)
 {
    gralloc_mapper *gr = (struct gralloc_mapper *)gralloc;
+   if (gr->fallback)
+      gr->fallback->ops.destroy(gr->fallback);
    delete gr;
 
    return 0;
@@ -217,12 +276,16 @@ u_gralloc_imapper_api_create()
       return NULL;
    }
    auto gr = new gralloc_mapper;
+   gr->fallback = u_gralloc_fallback_create();
    gr->base.ops.get_buffer_basic_info = mapper5_get_buffer_basic_info;
    gr->base.ops.get_buffer_color_info = mapper5_get_buffer_color_info;
    gr->base.ops.get_front_rendering_usage = mapper5_get_front_rendering_usage;
    gr->base.ops.destroy = destroy;
 
-   mesa_logi("Using IMapper %d API", mapper.getMapperVersion());
+   /* XCLIPSE: the enum's numbering changed: Android 12 counts from GRALLOC_2 = 0 (the header
+    * built against), Android 17 reports IMapper 5 as 5. Log the raw value. */
+   mesa_logi("Using IMapper API through libui (mapper version enum %d)",
+             (int)mapper.getMapperVersion());
 
    return &gr->base;
 }

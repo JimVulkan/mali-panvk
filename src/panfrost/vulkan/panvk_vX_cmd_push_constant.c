@@ -95,7 +95,6 @@ panvk_per_arch(cmd_prepare_compute_push_uniforms)(
                                 (uint64_t *)&cmdbuf->state.compute.sysvals);
 }
 
-#if PAN_ARCH < 10
 VkResult
 panvk_per_arch(cmd_prepare_gs_push_uniforms)(
    struct panvk_cmd_buffer *cmdbuf, const struct panvk_shader_variant *shader,
@@ -107,7 +106,6 @@ panvk_per_arch(cmd_prepare_gs_push_uniforms)(
    return prepare_push_uniforms(cmdbuf, shader, push_uniforms, 1,
                                 (uint64_t *)sysvals);
 }
-#endif
 
 VKAPI_ATTR void VKAPI_CALL
 panvk_per_arch(CmdPushConstants2KHR)(
@@ -130,3 +128,23 @@ panvk_per_arch(CmdPushConstants2KHR)(
 
    memcpy(data, pPushConstantsInfo->pValues, pPushConstantsInfo->size);
 }
+
+#if PAN_ARCH >= 9
+/* VK_EXT_descriptor_heap push data lives in the push constant space and is
+ * visible to every stage. */
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdPushDataEXT)(VkCommandBuffer commandBuffer,
+                               const VkPushDataInfoEXT *pPushDataInfo)
+{
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+
+   gfx_state_set_dirty(cmdbuf, VS_PUSH_UNIFORMS);
+   gfx_state_set_dirty(cmdbuf, FS_PUSH_UNIFORMS);
+   compute_state_set_dirty(cmdbuf, PUSH_UNIFORMS);
+
+   assert(pPushDataInfo->offset + pPushDataInfo->data.size <=
+          MAX_PUSH_CONSTANTS_SIZE);
+   memcpy((uint8_t *)cmdbuf->state.push_constants.data + pPushDataInfo->offset,
+          pPushDataInfo->data.address, pPushDataInfo->data.size);
+}
+#endif

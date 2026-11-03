@@ -154,7 +154,7 @@ panvk_queue_submit_kbase_chain(struct panvk_gpu_queue *queue, struct vk_queue_su
              nr_signals * sizeof(uint32_t));
    if (!d) {
       if (refresh)
-         panvk_per_arch(bc_emu_refresh_end)(dev, refresh, 0);
+         panvk_per_arch(bc_emu_refresh_end)(dev, refresh, NULL, 0);
       vk_device_set_lost(&dev->vk, "out of memory submitting");
       return;
    }
@@ -181,9 +181,15 @@ panvk_queue_submit_kbase_chain(struct panvk_gpu_queue *queue, struct vk_queue_su
          pan_kmod_kbase_wait_seq(dev->kmod.dev, d->cmdbufs[j]->kbase_seq);
    }
 
+   /* A wait the GPU has to keep (the CPU waited only for it to be submitted, see
+    * gpu_queue_submit): it covers the fragment atoms unless its second scope is fragment-only. */
+   for (uint32_t i = 0; i < submit->wait_count; i++) {
+      if (submit->waits[i].stage_mask & ~PANVK_FRAG_ONLY_STAGES)
+         queue->kbase_frag_wait = true;
+   }
+
    struct pan_kmod_kbase_atom atoms[PAN_KMOD_KBASE_MAX_ATOMS];
    unsigned nr_atoms = 0;
-   uint8_t last = 0;
 
    for (uint32_t j = 0; j < nr_cmdbufs; ++j) {
       struct panvk_cmd_buffer *cmdbuf = d->cmdbufs[j];
@@ -196,31 +202,70 @@ panvk_queue_submit_kbase_chain(struct panvk_gpu_queue *queue, struct vk_queue_su
             if (!pan_kmod_kbase_submit_async(dev->kmod.dev, atoms, nr_atoms, NULL, NULL, NULL))
                mesa_loge("panvk: the kbase submission was refused");
             nr_atoms = 0;
-            last = 0;
          }
 
+         /* The vertex/tiler atom waits for the one before it and for the last fragment atom
+          * that read its tiler heap, so it runs while the previous batch's fragment atom still
+          * does. It waits for all fragment work when something needs that, and so does one
+          * without a tiler heap (compute, copies, query and event batches): nothing records
+          * what those read. Fragment atoms run in order. */
+         const bool has_heap = batch->tiler.heap_desc.gpu != 0;
+         const uint8_t heap = has_heap ? PAN_KMOD_KBASE_TRACK_HEAP0 << batch->tiler_heap : 0;
+         if (batch->order & PANVK_BATCH_WAIT_FRAG)
+            queue->kbase_frag_wait = true;
+
+         uint8_t vtc = 0;
          if (batch->vtc_jc.first_job) {
+            const bool all_frags = queue->kbase_frag_wait || !has_heap;
+            uint8_t wait = PAN_KMOD_KBASE_TRACK_VTC |
+                           (all_frags ? PAN_KMOD_KBASE_TRACK_FRAG : heap);
+            uint8_t join = PAN_KMOD_KBASE_TRACK_VTC | heap;
+            const bool frag_ordered = batch->order & PANVK_BATCH_FRAG_ORDERED;
+            /* Only WRITE_VALUE jobs (a timestamp): on the fragment slot when it runs them,
+             * otherwise it queues on the vertex/tiler slot behind the next batch's geometry,
+             * which holds the fragment atoms waiting for it (G72: -8% to -24% fps). */
+            const bool frag_slot = frag_ordered && !batch->frag_jc.first_job &&
+                                   batch->vtc_jc.job_index == batch->nr_write_jobs &&
+                                   pan_kmod_kbase_frag_slot_writes(dev->kmod.dev);
+            if (frag_ordered) {
+               wait = PAN_KMOD_KBASE_TRACK_VTC | PAN_KMOD_KBASE_TRACK_FRAG;
+               join = PAN_KMOD_KBASE_TRACK_FRAG;
+            }
             atoms[nr_atoms] = (struct pan_kmod_kbase_atom){
                .jc = batch->vtc_jc.first_job,
-               .core_req = KBASE_JD_REQ_VERTEX_TILER,
+               .core_req = (frag_slot ? KBASE_JD_REQ_FRAGMENT : KBASE_JD_REQ_VERTEX_TILER) |
+                           (batch->needs_permon ? KBASE_JD_REQ_PERMON : 0),
                .atom_number = nr_atoms + 1,
-               .dep_atom = last,
+               .wait = wait,
+               .join = join,
             };
-            last = ++nr_atoms;
+            vtc = ++nr_atoms;
+            if (!frag_ordered)
+               queue->kbase_frag_wait = false;
          }
 
          if (batch->frag_jc.first_job) {
+            /* Without a vertex/tiler atom it waits for the newest one directly. */
             atoms[nr_atoms] = (struct pan_kmod_kbase_atom){
                .jc = batch->frag_jc.first_job,
                .core_req = KBASE_JD_REQ_FRAGMENT,
                .atom_number = nr_atoms + 1,
-               .dep_atom = last,
+               .dep_atom = vtc,
+               .wait = PAN_KMOD_KBASE_TRACK_FRAG | (vtc ? 0 : PAN_KMOD_KBASE_TRACK_VTC),
+               .join = PAN_KMOD_KBASE_TRACK_FRAG | heap,
             };
-            last = ++nr_atoms;
+            ++nr_atoms;
          }
+
+         if (batch->order & PANVK_BATCH_HOLD_FRAG)
+            queue->kbase_frag_wait = true;
 
          batch->issued = true;
       }
+
+      /* A barrier at the end of the command buffer reaches into the next one. */
+      if (cmdbuf->pending_frag_wait)
+         queue->kbase_frag_wait = true;
    }
 
    /* Before submitting: the completion may run before submit_async even returns. */
@@ -230,7 +275,7 @@ panvk_queue_submit_kbase_chain(struct panvk_gpu_queue *queue, struct vk_queue_su
    const uint64_t seq = pan_kmod_kbase_submit_async(
       dev->kmod.dev, atoms, nr_atoms, nr_signals ? &fence : NULL, panvk_kbase_submit_done, d);
    if (refresh)
-      panvk_per_arch(bc_emu_refresh_end)(dev, refresh, seq);
+      panvk_per_arch(bc_emu_refresh_end)(dev, refresh, NULL, seq);
    if (!seq) {
       /* Signal anyway, so nothing waits forever on work that was never sent. */
       panvk_kbase_submit_done(d, false);
@@ -274,7 +319,8 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
       if (batch->vtc_jc.first_job) {
          atoms[nr_atoms++] = (struct pan_kmod_kbase_atom){
             .jc = batch->vtc_jc.first_job,
-            .core_req = KBASE_JD_REQ_VERTEX_TILER,
+            .core_req = KBASE_JD_REQ_VERTEX_TILER |
+                        (batch->needs_permon ? KBASE_JD_REQ_PERMON : 0),
             .atom_number = 1,
          };
       }
@@ -575,7 +621,7 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
             bos[bo_idx++] = pan_kmod_bo_handle(batch->blit.dst);
 
          if (batch->vtc_jc.first_tiler)
-            bos[bo_idx++] = pan_kmod_bo_handle(dev->tiler_heap->bo);
+            bos[bo_idx++] = pan_kmod_bo_handle(dev->tiler_heap[batch->tiler_heap]->bo);
 
          bos[bo_idx++] = pan_kmod_bo_handle(dev->sample_positions->bo);
          assert(bo_idx == nr_bos);

@@ -20,6 +20,9 @@ struct panvk_cmd_buffer;
 
 struct panvk_precomp_ctx {
    struct panvk_cmd_buffer *cmdbuf;
+   /* CSF: run on the vertex/tiler queue instead of the compute one, in order with the draws
+    * around it (transform feedback). The caller saves the registers it clobbers. */
+   bool on_vt;
 };
 
 static inline struct panvk_precomp_ctx

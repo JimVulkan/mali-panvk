@@ -168,6 +168,7 @@ panvk_per_arch(get_physical_device_extensions)(
 #ifdef VK_USE_PLATFORM_DISPLAY_KHR
       .EXT_display_control = true,
 #endif
+      .EXT_descriptor_heap = PAN_ARCH >= 9,
       .EXT_descriptor_indexing = PAN_ARCH >= 9,
       .EXT_dynamic_rendering_unused_attachments = true,
       .EXT_extended_dynamic_state = true,
@@ -234,8 +235,8 @@ panvk_per_arch(get_physical_device_extensions)(
       .EXT_astc_decode_mode = PAN_ARCH >= 7,
       .EXT_texture_compression_astc_hdr = true,
       .EXT_tooling_info = true,
-      /* Captured from the geometry shader emulation (panvk_nir_lower_gs.c), job manager only. */
-      .EXT_transform_feedback = PAN_ARCH < 10,
+      /* Captured from the geometry shader emulation (panvk_nir_lower_gs.c). */
+      .EXT_transform_feedback = true,
       .EXT_vertex_attribute_divisor = true,
       .EXT_vertex_input_dynamic_state = true,
       .EXT_ycbcr_2plane_444_formats = PAN_ARCH >= 10,
@@ -334,8 +335,8 @@ panvk_per_arch(get_physical_device_features)(
        * supported_features -- so with it false the geometry shader is never handed to
        * cmd_bind_shaders at all and the whole emulation is dead code. (The assert that would
        * have caught it is compiled out in a release build.) */
-      .geometryShader = PAN_ARCH < 10,
-      .tessellationShader = PAN_ARCH < 9,
+      .geometryShader = true,
+      .tessellationShader = true,
       .sampleRateShading = true,
       .dualSrcBlend = true,
       .logicOp = true,
@@ -344,28 +345,32 @@ panvk_per_arch(get_physical_device_features)(
       .drawIndirectFirstInstance = true,
       .depthClamp = true,
       .depthBiasClamp = true,
-      /* v6/v7: an internal geometry shader draws the lines or points (polygon_mode_gs). */
-      .fillModeNonSolid = PAN_ARCH < 9,
+      /* An internal geometry shader draws the lines or points (polygon_mode_gs); on v9+ between
+       * the vertex shader's PANVK_VS_VARIANT_POLY_* variants. */
+      .fillModeNonSolid = true,
       .depthBounds = false,
       .wideLines = true,
       .largePoints = true,
       .alphaToOne = false,
-      /* v6/v7: gl_ViewportIndex from a geometry shader (panvk_nir_lower_viewport_scissor_fs). */
-      .multiViewport = PAN_ARCH < 9,
+      /* gl_ViewportIndex from a geometry shader (panvk_nir_lower_viewport_scissor_fs). */
+      .multiViewport = true,
       .samplerAnisotropy = true,
       .textureCompressionETC2 = has_texture_compression_etc2(device),
       .textureCompressionASTC_LDR = has_texture_compression_astc_ldr(device),
       .textureCompressionBC = has_texture_compression_bc(device),
       .occlusionQueryPrecise = true,
-      .pipelineStatisticsQuery = false,
+      /* Counted from the draw parameters, see panvk_pipeline_stats_state. */
+      .pipelineStatisticsQuery = true,
       /* On v13+, the hardware isn't speculatively referencing to invalid
          indices anymore. */
       /* v6/v7 run the vertex shader as a plain VERTEX job, once per vertex of the range --
        * IDVS is off there (panvk_vX_shader.c), which is what speculative references came
        * from. */
+      /* v13 shades only referenced vertices (probe/mali/vsstore.c, G725), and IDVS splits the
+       * stores over the position and varying variants, which the spec allows as extra
+       * invocations. vkd3d-proton needs this for D3D12 feature level 11_1 and up. */
       .vertexPipelineStoresAndAtomics =
-         PAN_ARCH < 9 ||
-         (PAN_ARCH >= 13 && instance->drirc.misc.enable_vertex_pipeline_stores_atomics) ||
+         PAN_ARCH < 9 || PAN_ARCH >= 13 ||
          instance->drirc.misc.force_enable_shader_atomics,
       .fragmentStoresAndAtomics = true,
       .shaderTessellationAndGeometryPointSize = false,
@@ -378,9 +383,9 @@ panvk_per_arch(get_physical_device_features)(
       .shaderSampledImageArrayDynamicIndexing = true,
       .shaderStorageBufferArrayDynamicIndexing = true,
       .shaderStorageImageArrayDynamicIndexing = true,
-      /* Per fragment on v6/v7, see panvk_nir_lower_clip_cull_fs. */
-      .shaderClipDistance = PAN_ARCH < 9,
-      .shaderCullDistance = PAN_ARCH < 9,
+      /* Per fragment, see panvk_nir_lower_clip_cull_fs. */
+      .shaderClipDistance = true,
+      .shaderCullDistance = true,
       .shaderFloat64 = false,
       .shaderInt64 = true,
       .shaderInt16 = true,
@@ -627,6 +632,10 @@ panvk_per_arch(get_physical_device_features)(
       /* VK_EXT_custom_border_color */
       .customBorderColors = true,
 
+      /* VK_EXT_descriptor_heap */
+      .descriptorHeap = PAN_ARCH >= 9,
+      .descriptorHeapCaptureReplay = false,
+
       /* VK_EXT_border_color_swizzle */
       .borderColorSwizzle = true,
       .borderColorSwizzleFromImage = true,
@@ -645,8 +654,8 @@ panvk_per_arch(get_physical_device_features)(
       .minLod = true,
 
       /* VK_EXT_transform_feedback: from geometry shaders, stream 0. */
-      .transformFeedback = PAN_ARCH < 10,
-      .geometryStreams = PAN_ARCH < 9,
+      .transformFeedback = true,
+      .geometryStreams = true,
 
       /* VK_EXT_primitive_topology_list_restart */
       .primitiveTopologyListRestart = true,
@@ -670,8 +679,8 @@ panvk_per_arch(get_physical_device_features)(
       .pipelineExecutableInfo = true,
 
       /* VK_KHR_robustness2 */
-      .robustBufferAccess2 = PAN_ARCH <= 7 || PAN_ARCH >= 11,
-      .robustImageAccess2 = false,
+      .robustBufferAccess2 = true,
+      .robustImageAccess2 = true,
       .nullDescriptor = PAN_ARCH <= 7 || PAN_ARCH >= 9,
 
       /* VK_EXT_shader_tile_image */
@@ -833,13 +842,20 @@ panvk_per_arch(get_physical_device_features)(
 }
 
 static uint32_t
-get_api_version()
+get_api_version(const struct panvk_physical_device *device, unsigned max_cbuf_atts)
 {
    const uint32_t version_override = vk_get_version_override();
    if (version_override)
       return version_override;
 
-   if (PAN_ARCH >= 10)
+   /* v9 has every feature 1.4 requires (set above for all of v9 and later). Bifrost has the
+    * features too; what it can miss are the limits 1.4 raises: 8 colour attachments (an 8 KiB
+    * tile buffer, which the G71 lacks), 256 compute invocations per workgroup, and
+    * timestampComputeAndGraphics (kbase only before v10). */
+   const bool bifrost_1_4 =
+      max_cbuf_atts >= 8 && device->kmod.dev->props.max_threads_per_wg >= 256 &&
+      pan_kmod_dev_is_kbase(device->kmod.dev) && device->kmod.dev->props.gpu_can_query_timestamp;
+   if (PAN_ARCH >= 9 || bifrost_1_4)
       return VK_MAKE_API_VERSION(0, 1, 4, VK_HEADER_VERSION);
 
    return VK_MAKE_API_VERSION(0, 1, 3, VK_HEADER_VERSION);
@@ -888,7 +904,7 @@ panvk_per_arch(get_physical_device_properties)(
    }
 
    *properties = (struct vk_properties){
-      .apiVersion = get_api_version(),
+      .apiVersion = get_api_version(device, max_cbuf_atts),
       .driverVersion = vk_get_driver_version(),
       .vendorID =
          instance->drirc.debug.force_vk_vendor ? instance->drirc.debug.force_vk_vendor : ARM_VENDOR_ID,
@@ -965,23 +981,23 @@ panvk_per_arch(get_physical_device_properties)(
       .maxVertexInputBindingStride = MESA_VK_MAX_VERTEX_BINDING_STRIDE,
       /* 32 vec4 varyings. */
       .maxVertexOutputComponents = 128,
-      /* v6/v7 emulate tessellation (panvk_nir_lower_gs.c); these are the spec minimums. */
-      .maxTessellationGenerationLevel = PAN_ARCH < 9 ? 64 : 0,
-      .maxTessellationPatchSize = PAN_ARCH < 9 ? 32 : 0,
-      .maxTessellationControlPerVertexInputComponents = PAN_ARCH < 9 ? 64 : 0,
-      .maxTessellationControlPerVertexOutputComponents = PAN_ARCH < 9 ? 64 : 0,
-      .maxTessellationControlPerPatchOutputComponents = PAN_ARCH < 9 ? 120 : 0,
-      .maxTessellationControlTotalOutputComponents = PAN_ARCH < 9 ? 2048 : 0,
-      .maxTessellationEvaluationInputComponents = PAN_ARCH < 9 ? 64 : 0,
-      .maxTessellationEvaluationOutputComponents = PAN_ARCH < 9 ? 64 : 0,
+      /* Tessellation is emulated (panvk_nir_lower_gs.c); these are the spec minimums. */
+      .maxTessellationGenerationLevel = 64,
+      .maxTessellationPatchSize = 32,
+      .maxTessellationControlPerVertexInputComponents = 64,
+      .maxTessellationControlPerVertexOutputComponents = 64,
+      .maxTessellationControlPerPatchOutputComponents = 120,
+      .maxTessellationControlTotalOutputComponents = 2048,
+      .maxTessellationEvaluationInputComponents = 64,
+      .maxTessellationEvaluationOutputComponents = 64,
       /* Matching what the vendor driver reports on the same chip, except invocations: the
        * emulation runs a geometry shader once per input primitive, not N times. */
       /* One emulation invocation per (primitive, gl_InvocationID); 32 is the spec minimum. */
-      .maxGeometryShaderInvocations = PAN_ARCH < 10 ? 32 : 1,
-      .maxGeometryInputComponents = PAN_ARCH < 10 ? 64 : 0,
-      .maxGeometryOutputComponents = PAN_ARCH < 10 ? 128 : 0,
-      .maxGeometryOutputVertices = PAN_ARCH < 10 ? 256 : 0,
-      .maxGeometryTotalOutputComponents = PAN_ARCH < 10 ? 1024 : 0,
+      .maxGeometryShaderInvocations = 32,
+      .maxGeometryInputComponents = 64,
+      .maxGeometryOutputComponents = 128,
+      .maxGeometryOutputVertices = 256,
+      .maxGeometryTotalOutputComponents = 1024,
       /* 32 vec4 varyings. */
       .maxFragmentInputComponents = 128,
       /* 8 render targets. */
@@ -1018,7 +1034,7 @@ panvk_per_arch(get_physical_device_properties)(
       .maxDrawIndirectCount = UINT32_MAX,
       .maxSamplerLodBias = (float)INT16_MAX / 256.0f,
       .maxSamplerAnisotropy = 16,
-      .maxViewports = PAN_ARCH < 9 ? 16 : 1,
+      .maxViewports = 16,
       .maxViewportDimensions = {MAX_FRAMEBUFFER_DIMENSION, MAX_FRAMEBUFFER_DIMENSION},
       .viewportBoundsRange = {-2.0f * MAX_FRAMEBUFFER_DIMENSION, 2.0f * MAX_FRAMEBUFFER_DIMENSION - 1.0f},
       .viewportSubPixelBits = 0,
@@ -1028,8 +1044,13 @@ panvk_per_arch(get_physical_device_properties)(
       .minTexelBufferOffsetAlignment = 16,
       /* Always aligned on a uniform slot (vec4). */
       .minUniformBufferOffsetAlignment = 16,
-      /* LOAD.i128 and LD_PKA.i128 which require 16B alignment */
-      .minStorageBufferOffsetAlignment = 16,
+      /* Bifrost: LOAD.i128 and LD_PKA.i128 require 16B alignment. Valhall
+       * and later take unaligned global accesses (bifrost_nir.c never
+       * splits or refuses to vectorize them on v9+), and SSBOs at 4/8/12-byte
+       * offsets take 128-bit loads, stores and atomics correctly on the G68
+       * (v9), G720 (v12), G925 (v13) and G1-Ultra (v14) (probe/mali/heapt.c,
+       * HEAPT_SSBO_OFF). vkd3d-proton's descriptor heap path needs <= 4. */
+      .minStorageBufferOffsetAlignment = PAN_ARCH >= 9 ? 4 : 16,
       /* Signed 4-bit value. */
       .minTexelOffset = -8,
       .maxTexelOffset = 7,
@@ -1053,12 +1074,15 @@ panvk_per_arch(get_physical_device_properties)(
       .storageImageSampleCounts = VK_SAMPLE_COUNT_1_BIT,
       .maxSampleMaskWords = 1,
       .timestampComputeAndGraphics =
-         PAN_ARCH >= 10 && device->kmod.dev->props.gpu_can_query_timestamp,
+         (PAN_ARCH >= 10 || pan_kmod_dev_is_kbase(device->kmod.dev)) &&
+         device->kmod.dev->props.gpu_can_query_timestamp,
       .timestampPeriod =
-         PAN_ARCH >= 10 ? panvk_get_gpu_system_timestamp_period(device) : 0,
-      .maxClipDistances = PAN_ARCH < 9 ? 8 : 0,
-      .maxCullDistances = PAN_ARCH < 9 ? 8 : 0,
-      .maxCombinedClipAndCullDistances = PAN_ARCH < 9 ? 8 : 0,
+         PAN_ARCH >= 10 || pan_kmod_dev_is_kbase(device->kmod.dev)
+            ? panvk_get_gpu_system_timestamp_period(device)
+            : 0,
+      .maxClipDistances = 8,
+      .maxCullDistances = 8,
+      .maxCombinedClipAndCullDistances = 8,
       .discreteQueuePriorities = 2,
       .pointSizeRange = {pointSizeRangeMin, pointSizeRangeMax},
       .lineWidthRange = {0.0, 7.9921875},
@@ -1335,6 +1359,28 @@ panvk_per_arch(get_physical_device_properties)(
       /* VK_EXT_custom_border_color */
       .maxCustomBorderColorSamplers = 32768,
 
+      /* VK_EXT_descriptor_heap: each heap is a resource table entry of
+       * PANVK_DESCRIPTOR_SIZE descriptors, indexed by a 24-bit handle. */
+      .samplerHeapAlignment = 64,
+      .resourceHeapAlignment = 64,
+      .maxSamplerHeapSize = PANVK_DESCRIPTOR_SIZE << 24,
+      .maxResourceHeapSize = PANVK_DESCRIPTOR_SIZE << 24,
+      .minSamplerHeapReservedRange = 0,
+      .minSamplerHeapReservedRangeWithEmbedded = 0,
+      .minResourceHeapReservedRange = 0,
+      .samplerDescriptorSize = PANVK_DESCRIPTOR_SIZE,
+      .imageDescriptorSize = PANVK_DESCRIPTOR_SIZE,
+      .bufferDescriptorSize = PANVK_DESCRIPTOR_SIZE,
+      .samplerDescriptorAlignment = PANVK_DESCRIPTOR_SIZE,
+      .imageDescriptorAlignment = PANVK_DESCRIPTOR_SIZE,
+      .bufferDescriptorAlignment = PANVK_DESCRIPTOR_SIZE,
+      .maxPushDataSize = 256, /* maxPushConstantsSize */
+      .imageCaptureReplayOpaqueDataSize = 0,
+      .maxDescriptorHeapEmbeddedSamplers = 2048,
+      .samplerYcbcrConversionCount = 1,
+      .sparseDescriptorHeaps = false,
+      .protectedDescriptorHeaps = false,
+
       /* VK_EXT_graphics_pipeline_library */
       .graphicsPipelineLibraryFastLinking = true,
       .graphicsPipelineLibraryIndependentInterpolationDecoration = true,
@@ -1351,16 +1397,16 @@ panvk_per_arch(get_physical_device_properties)(
 
       /* VK_EXT_transform_feedback. The data sizes are the staging record,
        * PANVK_XFB_MAX_RECORD_DWORDS dwords per vertex. */
-      .maxTransformFeedbackStreams = PAN_ARCH < 9 ? 4 : 1,
+      .maxTransformFeedbackStreams = 4,
       .maxTransformFeedbackBuffers = 4,
       .maxTransformFeedbackBufferSize = UINT32_MAX,
       .maxTransformFeedbackStreamDataSize = PANVK_XFB_MAX_RECORD_DWORDS * 4,
       .maxTransformFeedbackBufferDataSize = PANVK_XFB_MAX_RECORD_DWORDS * 4,
       .maxTransformFeedbackBufferDataStride = 2048,
-      .transformFeedbackQueries = false,
+      .transformFeedbackQueries = true,
       .transformFeedbackStreamsLinesTriangles = false,
       .transformFeedbackRasterizationStreamSelect = false,
-      .transformFeedbackDraw = false,
+      .transformFeedbackDraw = true,
 
       /* VK_EXT_shader_tile_image */
       .shaderTileImageCoherentReadAccelerated = PAN_ARCH >= 9,

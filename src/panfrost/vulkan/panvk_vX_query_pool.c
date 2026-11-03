@@ -70,7 +70,21 @@ panvk_per_arch(CreateQueryPool)(VkDevice _device,
       reports_per_query = 1;
       break;
    }
+#else
+   case VK_QUERY_TYPE_TIMESTAMP:
+      /* One WRITE_VALUE SYSTEM_TIMESTAMP (jm/panvk_vX_cmd_query.c). */
+      reports_per_query = 1;
+      break;
 #endif
+   case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
+      /* Primitives written, primitives needed (panlib_xfb_query_end on JM, zeros on CSF,
+       * which captures nothing). */
+      reports_per_query = 2;
+      break;
+   case VK_QUERY_TYPE_PIPELINE_STATISTICS:
+      /* One value per enabled statistic, in bit order (panvk_pipeline_stats_state). */
+      reports_per_query = MAX2(util_bitcount(pool->vk.pipeline_statistics), 1);
+      break;
    default:
       UNREACHABLE("Unsupported query type");
    }
@@ -283,7 +297,27 @@ panvk_per_arch(GetQueryPoolResults)(VkDevice _device, VkQueryPool queryPool,
                cpu_write_query_result(dst, 0, flags, src[0].value);
             break;
          }
+#else
+         case VK_QUERY_TYPE_TIMESTAMP: {
+            if (write_results)
+               cpu_write_query_result(dst, 0, flags, src[0].value);
+            break;
+         }
 #endif
+         case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT: {
+            if (write_results) {
+               cpu_write_query_result(dst, 0, flags, src[0].value);
+               cpu_write_query_result(dst, 1, flags, src[1].value);
+            }
+            break;
+         }
+         case VK_QUERY_TYPE_PIPELINE_STATISTICS: {
+            if (write_results) {
+               for (uint32_t r = 0; r < util_bitcount(pool->vk.pipeline_statistics); r++)
+                  cpu_write_query_result(dst, r, flags, src[r].value);
+            }
+            break;
+         }
          default:
             UNREACHABLE("Unsupported query type");
          }
@@ -292,8 +326,13 @@ panvk_per_arch(GetQueryPoolResults)(VkDevice _device, VkQueryPool queryPool,
       if (!write_results)
          status = VK_NOT_READY;
 
+      const uint32_t avail_idx =
+         pool->vk.query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT ? 2
+         : pool->vk.query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS
+            ? util_bitcount(pool->vk.pipeline_statistics)
+            : 1;
       if (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT)
-         cpu_write_query_result(dst, 1, flags, available);
+         cpu_write_query_result(dst, avail_idx, flags, available);
    }
 
    return status;

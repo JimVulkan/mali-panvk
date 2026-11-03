@@ -20,6 +20,18 @@ struct panvk_occlusion_query_state {
    enum mali_occlusion_mode mode;
 };
 
+/* VK_QUERY_TYPE_PIPELINE_STATISTICS. Mali has no pipeline counters, so the counts are derived
+ * from the parameters of direct draws and dispatches on the CPU (as gallium panfrost does for
+ * primitives generated) and written at the query end, one value per bit of
+ * VkQueryPipelineStatisticFlagBits. Indirect draws/dispatches and fragment invocations are not
+ * counted; geometry and tessellation counts assume one output primitive per input. */
+#define PANVK_PIPELINE_STAT_COUNT 11
+
+struct panvk_pipeline_stats_state {
+   bool active;
+   uint64_t counts[PANVK_PIPELINE_STAT_COUNT];
+};
+
 #if PAN_ARCH >= 10
 struct panvk_prims_generated_query_state {
    uint64_t syncobj;

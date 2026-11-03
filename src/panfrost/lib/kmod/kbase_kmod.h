@@ -38,11 +38,27 @@ struct pan_kmod_bo;
 /* Dependency type 1, as observed. kbase names 0 invalid, 1 data, 2 order. */
 #define KBASE_JD_DEP_DATA 1u
 
+/* Ordering tracks. The kmod remembers the newest atom in flight on each, across submissions, so
+ * an atom can be ordered after part of the earlier work instead of all of it: a vertex/tiler
+ * atom that waits for the previous vertex/tiler atom and for the last fragment atom that read its
+ * tiler heap runs alongside the fragment atom of the batch before it, as the vendor driver's do.
+ * Every vertex/tiler atom joins VTC and every fragment atom FRAG, so those two hold everything. */
+#define PAN_KMOD_KBASE_TRACK_VTC   (1u << 0)
+#define PAN_KMOD_KBASE_TRACK_FRAG  (1u << 1)
+#define PAN_KMOD_KBASE_TRACK_HEAP0 (1u << 2) /* HEAP0 << i: tiler heap i */
+#define PAN_KMOD_KBASE_NR_TRACKS   4
+
 struct pan_kmod_kbase_atom {
    uint64_t jc;           /* GPU VA of the job chain head */
    uint32_t core_req;     /* one of the KBASE_JD_REQ_* above */
    uint8_t atom_number;   /* 1..255; kbase treats 0 as unset */
    uint8_t dep_atom;      /* atom_number this one waits for, or 0 for none */
+   /* Tracks this atom is ordered after, and tracks it becomes the newest atom of. Both 0: it
+    * runs after everything submitted before (only after dep_atom when it has one, which is
+    * itself after everything) and joins every track. At most two waits in all, dep_atom
+    * included: that is what a kbase atom holds. */
+   uint8_t wait;
+   uint8_t join;
 };
 
 /* True when this device is driven by kbase rather than a DRM node. Every caller that would
@@ -60,7 +76,7 @@ struct util_sync_provider *pan_kmod_kbase_sync_provider(void);
 #define PAN_KMOD_KBASE_MAX_ATOMS 253
 
 /* Submit atoms without waiting for them. atom_number is 1..nr_atoms within the call and dep_atom
- * refers to those (0: none). The atoms run after everything submitted before on the device. When
+ * refers to those (0: none). The atoms are ordered as wait and join say (see above). When
  * fence_fd is not NULL it receives a sync file (the caller owns it) that signals once they have
  * all run, or -1 when there is nothing to wait for. done, if set, is called on the kmod's event
  * thread when every atom has reported, with ok false if one faulted. Returns the submission's
@@ -115,6 +131,10 @@ bool pan_kmod_kbase_is_csf(const struct pan_kmod_dev *dev);
 /* The firmware's interface, in the shape panthor reports it, so the CS builders size themselves
  * the same way on both kernels. */
 const struct drm_panthor_csif_info *pan_kmod_kbase_csif_props(const struct pan_kmod_dev *dev);
+
+/* JM: the fragment job slot runs WRITE_VALUE jobs (JS0_FEATURES bit 2), so an atom made only of
+ * those can be submitted as a fragment atom and run in line with the fragment work. */
+bool pan_kmod_kbase_frag_slot_writes(const struct pan_kmod_dev *dev);
 
 #define PAN_KMOD_KBASE_CSF_MAX_QUEUES 4
 

@@ -691,7 +691,7 @@ panvk_per_arch(cmd_init_render_state)(struct panvk_cmd_buffer *cmdbuf,
    if (z_att || s_att)
       render_state_set_zs_attachments(cmdbuf, z_att, s_att);
 
-   const struct pan_fb_bbox ra_px =
+   struct pan_fb_bbox ra_px =
       pan_fb_bbox_from_xywh(pRenderingInfo->renderArea.offset.x,
                             pRenderingInfo->renderArea.offset.y,
                             pRenderingInfo->renderArea.extent.width,
@@ -700,6 +700,12 @@ panvk_per_arch(cmd_init_render_state)(struct panvk_cmd_buffer *cmdbuf,
    if (render->bound_attachments) {
       render->fb.layout.width_px = att_width;
       render->fb.layout.height_px = att_height;
+      /* A render area larger than the attachments is invalid, but apps pass one: MojoLauncher
+       * below 100% resolution renders a window-sized area into a smaller swapchain. Unclipped,
+       * the tiles past the image are written past its memory (probe/mali/vkanb VKANB_RA_SCALE);
+       * the GPU page fault that follows panics MediaTek kernels (Mali-G615). */
+      ra_px = pan_fb_bbox_clamp(ra_px,
+                                pan_fb_bbox_from_xywh(0, 0, att_width, att_height));
    } else {
       render->fb.layout.width_px = (uint32_t)ra_px.max_x + 1;
       render->fb.layout.height_px = (uint32_t)ra_px.max_y + 1;
@@ -777,7 +783,6 @@ panvk_per_arch(cmd_select_tile_size)(struct panvk_cmd_buffer *cmdbuf)
  */
 #define MIN_DEPTH_CLIP_RANGE 37.7E-06f
 
-#if PAN_ARCH < 9
 /*
  * Several viewports, from a geometry shader writing gl_ViewportIndex: the emulation's per-viewport
  * transforms (the same arithmetic as viewport.scale/offset below) and the fragment shader's
@@ -787,7 +792,11 @@ panvk_per_arch(cmd_select_tile_size)(struct panvk_cmd_buffer *cmdbuf)
 static void
 prepare_gs_viewports(struct panvk_cmd_buffer *cmdbuf, BITSET_WORD *dirty_sysvals)
 {
+#if PAN_ARCH < 9
    const struct panvk_shader *gs = cmdbuf->state.gfx.gs.shader;
+#else
+   const struct panvk_shader *gs = cmdbuf->state.gfx.gs.app_shader;
+#endif
    uint64_t rects = 0;
 
    cmdbuf->state.gfx.gs.viewports = 0;
@@ -842,7 +851,6 @@ prepare_gs_viewports(struct panvk_cmd_buffer *cmdbuf, BITSET_WORD *dirty_sysvals
 
    set_gfx_sysval(cmdbuf, dirty_sysvals, fs.viewport_rects, rects);
 }
-#endif
 
 static void
 prepare_iam_sysvals(struct panvk_cmd_buffer *cmdbuf, BITSET_WORD *dirty_sysvals)
@@ -953,9 +961,12 @@ panvk_per_arch(cmd_prepare_draw_sysvals)(struct panvk_cmd_buffer *cmdbuf,
       }
    }
 
-   for (unsigned i = 0; i < MAX_RTS; i++) {
-      set_gfx_sysval(cmdbuf, dirty_sysvals, fs.blend_descs[i],
-                     cmdbuf->state.gfx.fs.blend_descs[i]);
+   if (cmdbuf->state.gfx.fs.blend_descs_dirty) {
+      for (unsigned i = 0; i < MAX_RTS; i++) {
+         set_gfx_sysval(cmdbuf, dirty_sysvals, fs.blend_descs[i],
+                        cmdbuf->state.gfx.fs.blend_descs[i]);
+      }
+      cmdbuf->state.gfx.fs.blend_descs_dirty = false;
    }
 
    if (dyn_gfx_state_dirty(cmdbuf, VP_VIEWPORTS) ||
@@ -1033,9 +1044,7 @@ panvk_per_arch(cmd_prepare_draw_sysvals)(struct panvk_cmd_buffer *cmdbuf,
    if (dyn_gfx_state_dirty(cmdbuf, INPUT_ATTACHMENT_MAP))
       prepare_iam_sysvals(cmdbuf, dirty_sysvals);
 
-#if PAN_ARCH < 9
    prepare_gs_viewports(cmdbuf, dirty_sysvals);
-#endif
 
    const struct panvk_shader_variant *vs =
       panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
@@ -1057,13 +1066,15 @@ panvk_per_arch(cmd_prepare_draw_sysvals)(struct panvk_cmd_buffer *cmdbuf,
                      fs_desc_state->dyn_ssbos);
    }
 
-   uint32_t used_set_mask = 0;
-   used_set_mask |= cmdbuf->state.gfx.vs.shader->desc_info.used_set_mask;
-   if (fs)
-      used_set_mask |= cmdbuf->state.gfx.fs.shader->desc_info.used_set_mask;
+   /* The set addresses only change with the bound sets or the shaders that use them. */
+   if (gfx_state_dirty(cmdbuf, DESC_STATE) || gfx_state_dirty(cmdbuf, VS) ||
+       gfx_state_dirty(cmdbuf, FS) || fs_user_dirty(cmdbuf)) {
+      uint32_t used_set_mask = 0;
+      used_set_mask |= cmdbuf->state.gfx.vs.shader->desc_info.used_set_mask;
+      if (fs)
+         used_set_mask |= cmdbuf->state.gfx.fs.shader->desc_info.used_set_mask;
 
-   for (uint32_t i = 0; i < MAX_SETS; i++) {
-      if (used_set_mask & BITFIELD_BIT(i)) {
+      u_foreach_bit(i, used_set_mask) {
          set_gfx_sysval(cmdbuf, dirty_sysvals, desc.sets[i],
                         desc_state->sets[i]->descs.dev);
       }

@@ -35,6 +35,9 @@
 #include "panvk_priv_bo.h"
 #include "panvk_sampler.h"
 
+#include "pan_buffer.h"
+#include "pan_desc.h"
+
 static const void *
 get_desc_slot_ptr(struct panvk_descriptor_set *set, uint32_t binding,
                   uint32_t elem, struct panvk_subdesc_info subdesc)
@@ -1026,3 +1029,198 @@ void panvk_per_arch(descriptor_set_flush)(struct panvk_descriptor_set *set)
    set->descs.dirty_min = SIZE_MAX;
    set->descs.dirty_max = 0;
 }
+
+#if PAN_ARCH >= 9
+/* VK_EXT_descriptor_heap */
+
+/* Returns the GPU address of a copy of a texture payload owned by the image,
+ * or 0 on allocation failure. */
+static uint64_t
+get_heap_payload(struct panvk_device *dev, struct panvk_image *image,
+                 const void *data, uint32_t size)
+{
+   uint64_t addr = 0;
+
+   simple_mtx_lock(&image->heap_payloads.lock);
+
+   util_dynarray_foreach(&image->heap_payloads.entries,
+                         struct panvk_heap_payload, p) {
+      if (p->size == size && !memcmp(p->data, data, size)) {
+         addr = panvk_priv_mem_dev_addr(p->mem);
+         goto out;
+      }
+   }
+
+   struct panvk_heap_payload p = {
+      .data = malloc(size),
+      .size = size,
+   };
+   if (!p.data)
+      goto out;
+
+   memcpy(p.data, data, size);
+   /* Over-aligned on purpose: the payload keeps its offsets relative to the
+    * view's allocation, whose alignment it then still satisfies. */
+   p.mem = panvk_pool_upload_aligned(&dev->mempools.rw, data, size, 256);
+   if (!panvk_priv_mem_check_alloc(p.mem)) {
+      free(p.data);
+      goto out;
+   }
+
+   util_dynarray_append(&image->heap_payloads.entries, p);
+   addr = panvk_priv_mem_dev_addr(p.mem);
+
+out:
+   simple_mtx_unlock(&image->heap_payloads.lock);
+   return addr;
+}
+
+static void
+write_heap_null_desc(void *dst)
+{
+   pan_cast_and_pack(dst, NULL_DESCRIPTOR, cfg)
+      ;
+}
+
+/* Texture descriptors point at a payload in the view's memory. The view is
+ * temporary, so the payload moves to the image and the descriptor's Surfaces
+ * pointer follows it. */
+static void
+write_heap_image_desc(struct panvk_device *dev,
+                      const VkImageDescriptorInfoEXT *info,
+                      VkDescriptorType type, void *dst)
+{
+   VkImageView view_h;
+
+   if (!info || !info->pView ||
+       panvk_per_arch(CreateImageView)(panvk_device_to_handle(dev),
+                                       info->pView, NULL,
+                                       &view_h) != VK_SUCCESS) {
+      write_heap_null_desc(dst);
+      return;
+   }
+
+   VK_FROM_HANDLE(panvk_image_view, view, view_h);
+   struct panvk_image *image =
+      container_of(view->vk.image, struct panvk_image, vk);
+   struct mali_texture_packed desc = type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                        ? view->descs.storage_tex[0]
+                                        : view->descs.tex[0];
+   const uint64_t view_mem = panvk_priv_mem_dev_addr(view->mem);
+   uint64_t surfaces;
+
+   STATIC_ASSERT(sizeof(desc) == PANVK_DESCRIPTOR_SIZE);
+   memcpy(&surfaces, (uint8_t *)&desc + 16, sizeof(surfaces));
+
+   if (view->mem_size && surfaces >= view_mem &&
+       surfaces < view_mem + view->mem_size) {
+      uint64_t payload =
+         get_heap_payload(dev, image, panvk_priv_mem_host_addr(view->mem),
+                          view->mem_size);
+      if (payload) {
+         surfaces = payload + (surfaces - view_mem);
+         memcpy((uint8_t *)&desc + 16, &surfaces, sizeof(surfaces));
+         memcpy(dst, &desc, sizeof(desc));
+      } else {
+         write_heap_null_desc(dst);
+      }
+   } else {
+      write_heap_null_desc(dst);
+   }
+
+   panvk_per_arch(DestroyImageView)(panvk_device_to_handle(dev), view_h, NULL);
+}
+
+static void
+write_heap_buffer_desc(const VkDeviceAddressRangeEXT *range,
+                       VkDescriptorType type, void *dst)
+{
+   if (!range || !range->address) {
+      write_heap_null_desc(dst);
+      return;
+   }
+
+   const bool is_ssbo = type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+   assert(range->size <= UINT32_MAX);
+
+   pan_cast_and_pack(dst, BUFFER, cfg) {
+      cfg.address = range->address;
+      cfg.size = align(range->size, is_ssbo ? 4 : 16);
+   }
+}
+
+static void
+write_heap_texel_buffer_desc(const VkTexelBufferDescriptorInfoEXT *info,
+                             void *dst)
+{
+   if (!info || !info->addressRange.address) {
+      write_heap_null_desc(dst);
+      return;
+   }
+
+   enum pipe_format pfmt = vk_format_to_pipe_format(info->format);
+   struct pan_buffer_view bview = {
+      .format = pfmt,
+      .width_el = info->addressRange.size / util_format_get_blocksize(pfmt),
+      .base = info->addressRange.address,
+   };
+
+   GENX(pan_buffer_texture_emit)(&bview, dst);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+panvk_per_arch(WriteSamplerDescriptorsEXT)(
+   VkDevice _device, uint32_t samplerCount,
+   const VkSamplerCreateInfo *pSamplers,
+   const VkHostAddressRangeEXT *pDescriptors)
+{
+   for (uint32_t i = 0; i < samplerCount; i++) {
+      struct vk_sampler_state state;
+      struct mali_sampler_packed desc;
+
+      vk_sampler_state_init(&state, &pSamplers[i]);
+      panvk_per_arch(sampler_state_fill_desc)(&state, &desc);
+
+      assert(pDescriptors[i].size >= sizeof(desc));
+      memcpy(pDescriptors[i].address, &desc, sizeof(desc));
+   }
+
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+panvk_per_arch(WriteResourceDescriptorsEXT)(
+   VkDevice _device, uint32_t resourceCount,
+   const VkResourceDescriptorInfoEXT *pResources,
+   const VkHostAddressRangeEXT *pDescriptors)
+{
+   VK_FROM_HANDLE(panvk_device, dev, _device);
+
+   for (uint32_t i = 0; i < resourceCount; i++) {
+      const VkResourceDescriptorInfoEXT *res = &pResources[i];
+      void *dst = pDescriptors[i].address;
+
+      assert(pDescriptors[i].size >= PANVK_DESCRIPTOR_SIZE);
+
+      switch (res->type) {
+      case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+      case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+      case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+         write_heap_image_desc(dev, res->data.pImage, res->type, dst);
+         break;
+      case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+      case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+         write_heap_buffer_desc(res->data.pAddressRange, res->type, dst);
+         break;
+      case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+      case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+         write_heap_texel_buffer_desc(res->data.pTexelBuffer, dst);
+         break;
+      default:
+         UNREACHABLE("Unsupported descriptor heap resource type");
+      }
+   }
+
+   return VK_SUCCESS;
+}
+#endif

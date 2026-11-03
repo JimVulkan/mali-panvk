@@ -614,7 +614,8 @@ lower_emit_vertex(nir_builder *b, nir_intrinsic_instr *intr, struct lower_gs_sta
       if (!st->xfb_dwords)
          return;
       nir_push_if(b, nir_iand(b, nir_ult_imm(b, counter, opts->max_output_verts),
-                              nir_ine_imm(b, st->xfb_staging, 0)));
+                              nir_iand(b, nir_ine_imm(b, st->xfb_staging, 0),
+                                       nir_ine_imm(b, st->stream_index, 0))));
       {
          nir_def *slot = stream_vtx_slot(b, st, stream, counter);
          stage_xfb_record(b, st, slot);
@@ -685,7 +686,11 @@ lower_emit_vertex(nir_builder *b, nir_intrinsic_instr *intr, struct lower_gs_sta
 
          /* Point size lives in its own fp16 buffer, and the other built-ins (layer, clip
           * distances) have no path to the tiler here yet. */
-         if (loc < VARYING_SLOT_VAR0 || var->data.compact)
+         /* v9+ polygon mode carries the clip distances as plain vec4 slots
+          * (build_polygon_mode_gs); a compact gl_ClipDistance still has no path. */
+         if ((loc < VARYING_SLOT_VAR0 && loc != VARYING_SLOT_CLIP_DIST0 &&
+              loc != VARYING_SLOT_CLIP_DIST1) ||
+             var->data.compact)
             continue;
 
          /* One location per element of an output array, each at the component the variable
@@ -752,9 +757,13 @@ lower_end_primitive(nir_builder *b, nir_intrinsic_instr *intr, struct lower_gs_s
    const unsigned vpp = opts->output_verts_per_prim;
    const unsigned stream = nir_intrinsic_stream_id(intr);
 
-   /* Another stream than 0 only feeds transform feedback. */
+   /* Another stream than 0 only feeds transform feedback, and only a capturing draw has its
+    * index list: outside a capture xfb_stream_index is 0, and a store through it is a GPU write
+    * fault (on MediaTek kbase a kernel panic). */
    if (stream != 0 && !st->xfb_dwords)
       return;
+   if (stream != 0)
+      nir_push_if(b, nir_ine_imm(b, st->stream_index, 0));
 
    /* nir_lower_gs_intrinsics passes end_primitive_with_counter(count, count_per_primitive):
     * src[0] is the RUNNING TOTAL of vertices emitted by this invocation so far, and src[1] is
@@ -820,6 +829,9 @@ lower_end_primitive(nir_builder *b, nir_intrinsic_instr *intr, struct lower_gs_s
                        .align_mul = 4, .write_mask = 0x1);
       nir_pop_if(b, NULL);
    }
+
+   if (stream != 0)
+      nir_pop_if(b, NULL);
 }
 
 /*
@@ -852,6 +864,16 @@ emit_degenerate_fill(nir_builder *b, struct lower_gs_state *st)
       nir_store_var(b, i, nir_iadd_imm(b, iv, 1), 1);
    }
    nir_pop_loop(b, NULL);
+
+   /* A point has no zero-area form: the degenerate index draws whatever position its slot holds,
+    * stale memory unless the shader emits there. So on the clip-space output (v9+) the slot's
+    * position starts far outside every viewport, and the first emitted vertex overwrites it. */
+   if (opts->output_verts_per_prim == 1 && !opts->hardpos) {
+      nir_push_if(b, nir_ine_imm(b, st->out_clip_space, 0));
+      store_components(b, st->out_pos, nir_imul_imm(b, st->out_vtx_base, opts->pos_stride),
+                       nir_imm_vec4(b, -1.0e6f, -1.0e6f, 0.0f, 1.0f));
+      nir_pop_if(b, NULL);
+   }
 
    nir_barrier(b, .memory_scope = SCOPE_WORKGROUP,
                .memory_semantics = NIR_MEMORY_ACQ_REL,

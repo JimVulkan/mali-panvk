@@ -130,6 +130,17 @@ panlib_copy_query_result(uint64_t pool_addr, global uint32_t *available_addr,
       case VK_QUERY_TYPE_OCCLUSION:
          write_occlusion_query_result(dst, 0, flags, report_addr, report_count);
          break;
+      case VK_QUERY_TYPE_TIMESTAMP:
+         vk_write_query(dst, 0, flags, report_addr[0]);
+         break;
+      case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
+         vk_write_query(dst, 0, flags, report_addr[0]);
+         vk_write_query(dst, 1, flags, report_addr[1]);
+         break;
+      case VK_QUERY_TYPE_PIPELINE_STATISTICS:
+         for (uint32_t r = 0; r < report_count; r++)
+            vk_write_query(dst, r, flags, report_addr[r]);
+         break;
       default:
          UNREACHABLE("Unsupported query type");
          break;
@@ -137,7 +148,10 @@ panlib_copy_query_result(uint64_t pool_addr, global uint32_t *available_addr,
    }
 
    if (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) {
-      vk_write_query(dst, 1, flags, available);
+      const int32_t idx = query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT ? 2
+                          : query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS ? (int32_t)report_count
+                                                                            : 1;
+      vk_write_query(dst, idx, flags, available);
    }
 }
 

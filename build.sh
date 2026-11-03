@@ -5,7 +5,7 @@
 #   The NDK can also come from ANDROID_NDK_HOME or ANDROID_NDK_ROOT. Linux only (WSL works): the
 #   first stage builds host tools that need LLVM.
 #   BUILD_DIR overrides the Android build directory (default: build-android).
-#   GRALLOC=0 builds without the IMapper 4.0 gralloc backend (see README.md, Gralloc).
+#   GRALLOC=0 builds without the libui gralloc backend (see README.md, Gralloc).
 #
 # Two stages:
 #   1. build-host: mesa_clc, vtn_bindgen2 and panfrost_compile, native, from this tree. They

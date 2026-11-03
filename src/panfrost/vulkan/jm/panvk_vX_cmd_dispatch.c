@@ -141,6 +141,8 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
       return;
 #endif
 
+   panvk_stats_add_dispatch(cmdbuf, cs, info);
+
    panvk_per_arch(cmd_close_batch)(cmdbuf);
    struct panvk_batch *batch = panvk_per_arch(cmd_open_batch)(cmdbuf);
 

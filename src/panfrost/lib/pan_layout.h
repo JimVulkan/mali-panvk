@@ -142,6 +142,9 @@ struct pan_image_layout_constraints {
     * and array_size > 1, used as array_stride_B directly. */
    uint64_t wsi_array_pitch_B;
 
+   /* XCLIPSE: plane size in bytes from the producer, 0 if unknown. Only AFBC imports use it. */
+   uint64_t wsi_plane_size_B;
+
    /* When true, AFBC/AFRC imports are stricter than they were when those
     * modifiers where introduced. */
    bool strict;

@@ -28,4 +28,9 @@ struct panvk_sampler {
 VK_DEFINE_NONDISP_HANDLE_CASTS(panvk_sampler, vk.base, VkSampler,
                                VK_OBJECT_TYPE_SAMPLER)
 
+/* Packs the first sampler plane of a sampler state, for samplers that have
+ * no VkSampler object (descriptor heap writes, embedded samplers). */
+void panvk_per_arch(sampler_state_fill_desc)(
+   const struct vk_sampler_state *state, struct mali_sampler_packed *desc);
+
 #endif

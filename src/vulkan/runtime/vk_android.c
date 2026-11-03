@@ -188,6 +188,13 @@ vk_gralloc_to_drm_explicit_layout(
       out_layouts[i].rowPitch = info.strides[i];
    }
 
+   /* XCLIPSE: the size of a lone plane is the allocator's, so a driver can bound the plane by
+    * the producer's layout instead of its own (an AFBC body placed further out than the driver
+    * would place it). An application's explicit create info always has size 0 here (VUID 02267),
+    * so only this internal one carries it. */
+   if (info.num_planes == 1 && info.layer_count <= 1 && info.alloc_size > 0)
+      out_layouts[0].size = info.alloc_size;
+
    /* Compute arrayPitch for multi-layer buffers. The gralloc HAL does not
     * expose a per-layer stride directly, but we can derive it from the
     * total allocation size and layer count. Disjoint multi-plane buffers

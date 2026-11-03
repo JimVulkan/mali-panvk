@@ -19,6 +19,9 @@
 struct panvk_gpu_queue {
    struct vk_queue vk;
    uint32_t sync;
+   /* kbase: the next vertex/tiler atom has to wait for every fragment atom before it
+    * (PANVK_BATCH_WAIT_FRAG and HOLD_FRAG, from earlier batches and submissions). */
+   bool kbase_frag_wait;
 };
 
 VK_DEFINE_HANDLE_CASTS(panvk_gpu_queue, vk.base, VkQueue, VK_OBJECT_TYPE_QUEUE)

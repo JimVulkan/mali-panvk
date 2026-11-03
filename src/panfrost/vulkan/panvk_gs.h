@@ -153,6 +153,9 @@ struct panvk_gs_push {
  * 0-15). 128 dwords is every component of 32 output locations. */
 #define PANVK_XFB_MAX_RECORD_DWORDS 128
 
+/* Room for a vertex shader's nir_xfb_info (24 bytes + 16 per output): 64 outputs. */
+#define PANVK_VS_XFB_INFO_QWORDS 160
+
 /* Fills table (PANVK_XFB_MAX_RECORD_DWORDS entries) and returns the record size in dwords, 0 for a
  * shader that captures nothing, or -1 for one this emulation cannot capture. */
 int panvk_gs_xfb_table(const struct nir_xfb_info *xfb, uint32_t *table);

@@ -9,6 +9,7 @@
 #include "genxml/cs_builder.h"
 #include "genxml/decode.h"
 
+#include "panvk_bc_emu.h"
 #include "panvk_buffer.h"
 #include "panvk_cmd_buffer.h"
 #include "panvk_device_memory.h"
@@ -389,7 +390,9 @@ get_resource_mask(enum panvk_subqueue_id subqueue)
 {
    switch (subqueue) {
    case PANVK_SUBQUEUE_VERTEX_TILER:
-      return CS_IDVS_RES | CS_TILER_RES;
+      /* Compute too: the geometry shader emulation and transform feedback run their compute
+       * jobs on this queue, between the draws they belong to. */
+      return CS_IDVS_RES | CS_TILER_RES | CS_COMPUTE_RES;
    case PANVK_SUBQUEUE_FRAGMENT:
       return CS_FRAG_RES;
    case PANVK_SUBQUEUE_COMPUTE:
@@ -1573,23 +1576,34 @@ panvk_queue_submit_kbase(struct panvk_gpu_queue *queue, struct vk_queue_submit *
                             DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
    }
 
-   unsigned max_calls = PANVK_SUBQUEUE_COUNT;
+   /* Linear images of emulated BC formats first, from what the host may have written into them
+    * since (panvk_bc_emu.h). Held until the submission has its sequence number. */
+   struct panvk_cmd_buffer *refresh =
+      vk_submit->command_buffer_count ? panvk_per_arch(bc_emu_refresh_begin)(dev) : NULL;
+   const uint32_t nr_cmdbufs = vk_submit->command_buffer_count + (refresh ? 1 : 0);
+   struct panvk_cmd_buffer *cmdbufs[nr_cmdbufs ? nr_cmdbufs : 1];
+   if (refresh)
+      cmdbufs[0] = refresh;
    for (uint32_t i = 0; i < vk_submit->command_buffer_count; i++)
-      max_calls += PANVK_SUBQUEUE_COUNT;
+      cmdbufs[i + (refresh ? 1 : 0)] =
+         container_of(vk_submit->command_buffers[i], struct panvk_cmd_buffer, vk);
+
+   const unsigned max_calls = PANVK_SUBQUEUE_COUNT * (1 + nr_cmdbufs);
    struct pan_kmod_kbase_cs_call *calls = malloc(max_calls * sizeof(*calls));
    struct panvk_kbase_csf_done *d =
       malloc(sizeof(*d) + vk_submit->signal_count * sizeof(uint32_t));
    if (!calls || !d) {
       free(calls);
       free(d);
+      if (refresh)
+         panvk_per_arch(bc_emu_refresh_end)(dev, refresh, NULL, 0);
       return vk_queue_set_lost(&queue->vk, "out of memory submitting");
    }
    unsigned nr_calls = 0;
 
    /* Resources a subqueue has not asked the firmware for yet come first. */
-   for (uint32_t i = 0; i < vk_submit->command_buffer_count; i++) {
-      struct panvk_cmd_buffer *cmdbuf =
-         container_of(vk_submit->command_buffers[i], struct panvk_cmd_buffer, vk);
+   for (uint32_t i = 0; i < nr_cmdbufs; i++) {
+      struct panvk_cmd_buffer *cmdbuf = cmdbufs[i];
       for (uint32_t j = 0; j < PANVK_SUBQUEUE_COUNT; j++) {
          struct cs_builder *b = panvk_get_cs_builder(cmdbuf, j);
          struct panvk_subqueue *subq = &queue->subqueues[j];
@@ -1604,9 +1618,8 @@ panvk_queue_submit_kbase(struct panvk_gpu_queue *queue, struct vk_queue_submit *
       }
    }
 
-   for (uint32_t i = 0; i < vk_submit->command_buffer_count; i++) {
-      struct panvk_cmd_buffer *cmdbuf =
-         container_of(vk_submit->command_buffers[i], struct panvk_cmd_buffer, vk);
+   for (uint32_t i = 0; i < nr_cmdbufs; i++) {
+      struct panvk_cmd_buffer *cmdbuf = cmdbufs[i];
       for (uint32_t j = 0; j < PANVK_SUBQUEUE_COUNT; j++) {
          struct cs_builder *b = panvk_get_cs_builder(cmdbuf, j);
          assert(cs_is_valid(b));
@@ -1634,6 +1647,8 @@ panvk_queue_submit_kbase(struct panvk_gpu_queue *queue, struct vk_queue_submit *
                                 BITFIELD_MASK(PANVK_SUBQUEUE_COUNT), wait_seq,
                                 panvk_kbase_csf_done, d);
    free(calls);
+   if (refresh)
+      panvk_per_arch(bc_emu_refresh_end)(dev, refresh, queue->kbase_group, seq);
    if (!seq) {
       /* Signal anyway, so nothing waits forever on work that was never sent. */
       panvk_kbase_csf_done(d, false);

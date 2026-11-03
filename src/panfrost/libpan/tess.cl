@@ -21,8 +21,9 @@
 #include "genxml/gen_macros.h"
 #include "lib/pan_encoder.h"
 #include "poly/cl/tessellator.h"
+#include "draw_helper.h"
 
-#if PAN_ARCH >= 6 && PAN_ARCH <= 7
+#if PAN_ARCH >= 6
 
 KERNEL(1)
 panlib_tess_isoline(constant struct poly_tess_params *p, uint32_t mode)
@@ -45,6 +46,7 @@ panlib_tess_quad(constant struct poly_tess_params *p, uint32_t mode)
       poly_tess_quad_process(p, patch, (enum poly_tess_mode)mode);
 }
 
+#if PAN_ARCH <= 7
 /*
  * An indirect tessellated draw: the vertex and instance counts are in the argument buffer, so
  * this sizes on the GPU what emit_tess_jobs sizes on the CPU for a direct draw. The patch counts
@@ -105,6 +107,41 @@ panlib_tess_setup_indirect(global struct poly_tess_params *p, constant uint32_t 
    *num_wg_x = ppi;
    *num_wg_y = instances;
 }
+#endif
+
+#if PAN_ARCH >= 9
+/*
+ * v9+: an indirect tessellated draw. The vertex pass's setup has already clamped the command
+ * (out_cmd), so the patch counts follow from it. The patch arrays were allocated for max_patches;
+ * a draw with more gets no patches, which the tessellator and the tess eval pass read as nothing
+ * to draw. The tess control grid never goes below 1x1: its one workgroup then writes into patch
+ * slot 0, which nothing reads.
+ */
+KERNEL(1)
+panlib_tess_indirect_setup(global struct libpan_tess_indirect *t)
+{
+   global struct libpan_gs_indirect *d = (global struct libpan_gs_indirect *)t->gs;
+   global struct poly_tess_params *p = (global struct poly_tess_params *)t->params;
+
+   uint ppi = d->out_cmd[0] / t->patch_size;
+   uint inst = d->out_cmd[1];
+   if ((ulong)ppi * inst > t->max_patches)
+      ppi = inst = 0;
+
+   p->patches_per_instance = ppi;
+   p->nr_patches = ppi * inst;
+
+   t->tcs.job_x = max(ppi, 1u);
+   t->tcs.job_y = max(inst, 1u);
+   t->tcs.attrib_offset = 0;
+
+   global uint8_t *fau = (global uint8_t *)t->fau;
+   if (t->wg_x_off != ~0u)
+      *(global uint32_t *)(fau + t->wg_x_off) = ppi;
+   if (t->wg_y_off != ~0u)
+      *(global uint32_t *)(fau + t->wg_y_off) = inst;
+}
+#endif
 
 /*
  * Serial on purpose: one thread, one pass over the patch counts. The draws this serves have
@@ -133,10 +170,15 @@ panlib_tess_prefix_sum(global struct poly_tess_params *p, uint32_t reset_heap,
 
    uint size_B = align(total * 4, 16);
    uint bottom = p->heap->bottom;
-   if (bottom + size_B + 16 >= p->heap->size) {
-      /* Every patch gets zero indices; WITH_COUNTS then writes nothing. */
+   /* WITH_COUNTS then allocates the domain points from the same heap, and its allocator aborts
+    * on overflow: there are at most as many points as indices, 8 bytes each, plus a 16-byte
+    * alignment allowance per patch. */
+   const ulong need = (ulong)bottom + 3ul * size_B + 32ul * p->nr_patches + 16;
+   if (need >= p->heap->size) {
+      /* Every patch gets zero indices, and with no patches left WITH_COUNTS writes nothing. */
       for (uint i = 0; i < p->nr_patches; i++)
          p->counts[i] = 0;
+      p->nr_patches = 0;
       total = 0;
       size_B = 0;
    }

@@ -84,7 +84,7 @@ const struct pan_model pan_model_list[] = {
    BIFROST_MODEL(PAN_PROD_ID(7, 0, 3),    "G31",    "G31", MODEL_ANISO(ALL),  MODEL_TB_SIZES( 8192,  8192), MODEL_RATES(2, 2,  8)),
    BIFROST_MODEL(PAN_PROD_ID(7, 2, 1),    "G76",    "G76", MODEL_ANISO(ALL),  MODEL_TB_SIZES(16384,  8192), MODEL_RATES(2, 2, 24)),
    BIFROST_MODEL(PAN_PROD_ID(7, 2, 2),    "G52",    "G52", MODEL_ANISO(ALL),  MODEL_TB_SIZES(16384,  8192), MODEL_RATES(2, 2, 24)),
-   BIFROST_MODEL(PAN_PROD_ID(7, 4, 2),    "G52 r1", "G52", MODEL_ANISO(ALL),  MODEL_TB_SIZES( 8192,  8192), MODEL_RATES(2, 2, 24)),
+   BIFROST_MODEL(PAN_PROD_ID(7, 4, 2),    "G52",    "G52", MODEL_ANISO(ALL),  MODEL_TB_SIZES( 8192,  8192), MODEL_RATES(2, 2, 24)),
 
    VALHALL_MODEL(PAN_PROD_ID(9, 0, 0), 0, "G77",    "G77", MODEL_ANISO(ALL),  MODEL_TB_SIZES(16384,  8192),
                                               MODEL_RATES_X(2, 4, 8,  32,  32, 8)),
@@ -96,25 +96,35 @@ const struct pan_model pan_model_list[] = {
                                               MODEL_RATES_X(2, 4, 8,  32,  32, 8)),
    VALHALL_MODEL(PAN_PROD_ID(9, 2, 4), 0, "G68",    "G78", MODEL_ANISO(ALL),  MODEL_TB_SIZES(16384,  8192),
                                               MODEL_RATES_X(2, 4, 8,  32,  32, 8)),
+   /* G710 = kbase TODX (10, 2): GPU_ID 0xa8620000/0xa8620004 in the vendor driver's reports
+    * (Pixel 7, Dimensity 9000). Variant 0 is from a third-party Pixel 7 run, not ours; it is
+    * the G610's core in larger configurations, so it takes the G610's numbers. */
+   VALHALL_MODEL(PAN_PROD_ID(10, 8, 2), 0, "G710",   "G710", MODEL_ANISO(ALL),  MODEL_TB_SIZES(32768, 16384),
+                                              MODEL_RATES_X(4, 8, 16,  64,  64, 16)),
    VALHALL_MODEL(PAN_PROD_ID(10, 8, 7), 0, "G610",   "G710", MODEL_ANISO(ALL),  MODEL_TB_SIZES(32768, 16384),
                                               MODEL_RATES_X(4, 8, 16,  64,  64, 16)),
    /* var/cvt/sfu rates might not be correct (we haven't found any detailed documentation) */
-   VALHALL_MODEL(PAN_PROD_ID(10, 12, 4), 0, "G310v1",   "G710", MODEL_ANISO(ALL),  MODEL_TB_SIZES(16384,  8192),
+   VALHALL_MODEL(PAN_PROD_ID(10, 12, 4), 0, "G310",   "G710", MODEL_ANISO(ALL),  MODEL_TB_SIZES(16384,  8192),
                                               MODEL_RATES_X(2, 2,  8,  16,  16, 4)),
-   VALHALL_MODEL(PAN_PROD_ID(10, 12, 4), 1, "G310v2",   "G710", MODEL_ANISO(ALL),  MODEL_TB_SIZES(16384,  8192),
+   VALHALL_MODEL(PAN_PROD_ID(10, 12, 4), 1, "G310",   "G710", MODEL_ANISO(ALL),  MODEL_TB_SIZES(16384,  8192),
                                               MODEL_RATES_X(2, 4,  8,  32,  32, 8)),
-   VALHALL_MODEL(PAN_PROD_ID(10, 12, 4), 2, "G310v3",   "G710", MODEL_ANISO(ALL),  MODEL_TB_SIZES(16384,  8192),
+   VALHALL_MODEL(PAN_PROD_ID(10, 12, 4), 2, "G310",   "G710", MODEL_ANISO(ALL),  MODEL_TB_SIZES(16384,  8192),
                                               MODEL_RATES_X(4, 4,  8,  48,  48, 12)),
-   VALHALL_MODEL(PAN_PROD_ID(10, 12, 4), 3, "G310v4",   "G710", MODEL_ANISO(ALL),  MODEL_TB_SIZES(32768, 16384),
+   VALHALL_MODEL(PAN_PROD_ID(10, 12, 4), 3, "G310",   "G710", MODEL_ANISO(ALL),  MODEL_TB_SIZES(32768, 16384),
                                               MODEL_RATES_X(4, 8,  8,  48,  48, 12)),
-   VALHALL_MODEL(PAN_PROD_ID(10, 12, 4), 4, "G310v5",   "G710", MODEL_ANISO(ALL),  MODEL_TB_SIZES(32768, 16384),
+   VALHALL_MODEL(PAN_PROD_ID(10, 12, 4), 4, "G310",   "G710", MODEL_ANISO(ALL),  MODEL_TB_SIZES(32768, 16384),
                                               MODEL_RATES_X(4, 8,  8,  64,  64, 16)),
 
    VALHALL_MODEL(PAN_PROD_ID(11, 8, 2), 4, "G715-Immortalis", "G715", MODEL_ANISO(ALL), MODEL_TB_SIZES(32768, 16384),
                                               MODEL_RATES_X(4, 8,  8,  64,  64, 16),
                                               .min_core_count = 10,
                                               .required_gpu_features = GPU_FEAT_RAY_INTERSECTION),
+   /* Names and core-count splits follow panthor's get_gpu_model_name(): below 7 cores this
+    * product is sold as G615, below 6 the G720 and G725 ones as G620 and G625. */
    VALHALL_MODEL(PAN_PROD_ID(11, 8, 2), 4,  "G715",   "G715", MODEL_ANISO(ALL),  MODEL_TB_SIZES(32768, 16384),
+                                              MODEL_RATES_X(4, 8, 32,  64, 128, 16),
+                                              .min_core_count = 7),
+   VALHALL_MODEL(PAN_PROD_ID(11, 8, 2), 4,  "G615",   "G715", MODEL_ANISO(ALL),  MODEL_TB_SIZES(32768, 16384),
                                               MODEL_RATES_X(4, 8, 32,  64, 128, 16)),
 
    VALHALL_MODEL(PAN_PROD_ID(11, 8, 3), 4,  "G615",   "G715", MODEL_ANISO(ALL),  MODEL_TB_SIZES(32768, 16384),
@@ -125,6 +135,9 @@ const struct pan_model pan_model_list[] = {
                                               .min_core_count = 10,
                                               .required_gpu_features = GPU_FEAT_RAY_INTERSECTION),
    FIFTHGEN_MODEL(PAN_PROD_ID(12, 8, 0), 4, "G720",  "G720", MODEL_ANISO(ALL),  MODEL_TB_SIZES(65536, 32768),
+                                              MODEL_RATES_X(4, 8, 32,  64, 128, 16),
+                                              .min_core_count = 6),
+   FIFTHGEN_MODEL(PAN_PROD_ID(12, 8, 0), 4, "G620",  "G720", MODEL_ANISO(ALL),  MODEL_TB_SIZES(65536, 32768),
                                               MODEL_RATES_X(4, 8, 32,  64, 128, 16)),
 
    /** G925 is a G725 with ray tracing and sufficiently many cores. Keep this before G725 to prefer it when both match. */
@@ -133,6 +146,9 @@ const struct pan_model pan_model_list[] = {
                                               .min_core_count = 10,
                                               .required_gpu_features = GPU_FEAT_RAY_INTERSECTION),
    FIFTHGEN_MODEL(PAN_PROD_ID(13, 8, 0), 4, "G725",  "G725", MODEL_ANISO(ALL),  MODEL_TB_SIZES(65536, 65536),
+                                              MODEL_RATES_X(4, 8, 32, 128, 128, 16),
+                                              .min_core_count = 6),
+   FIFTHGEN_MODEL(PAN_PROD_ID(13, 8, 0), 4, "G625",  "G725", MODEL_ANISO(ALL),  MODEL_TB_SIZES(65536, 65536),
                                               MODEL_RATES_X(4, 8, 32, 128, 128, 16)),
 
    FIFTHGEN_MODEL(PAN_PROD_ID(14, 8, 0), 4, "G1-Ultra",  "G1", MODEL_ANISO(ALL),  MODEL_TB_SIZES(65536, 65536),

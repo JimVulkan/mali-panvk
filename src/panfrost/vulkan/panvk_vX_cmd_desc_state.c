@@ -267,7 +267,9 @@ panvk_per_arch(cmd_prepare_shader_res_table)(
 {
    uint32_t first_unused_set = util_last_bit(desc_info->used_set_mask);
    uint32_t res_count =
-      ALIGN_POT(1 + first_unused_set, MALI_RESOURCE_TABLE_SIZE_ALIGNMENT);
+      ALIGN_POT(desc_info->uses_heaps ? PANVK_HEAP_TABLE_END
+                                      : 1 + first_unused_set,
+                MALI_RESOURCE_TABLE_SIZE_ALIGNMENT);
    struct pan_ptr ptr =
       panvk_cmd_alloc_desc_array(cmdbuf, res_count * repeat_count, RESOURCE);
    if (!ptr.gpu)
@@ -307,6 +309,29 @@ panvk_per_arch(cmd_prepare_shader_res_table)(
             cfg.address = 0;
             cfg.contains_descriptors = false;
             cfg.size = 0;
+         }
+      }
+
+      if (desc_info->uses_heaps) {
+         static const uint32_t heap_tables[] = {
+            [PANVK_HEAP_RESOURCE] = PANVK_HEAP_RESOURCE_TABLE,
+            [PANVK_HEAP_SAMPLER] = PANVK_HEAP_SAMPLER_TABLE,
+         };
+
+         for (uint32_t h = 0; h < ARRAY_SIZE(heap_tables); h++) {
+            pan_pack(&res_table[heap_tables[h]], RESOURCE, cfg) {
+               cfg.address = desc_state->heaps[h].addr;
+               cfg.size = desc_state->heaps[h].size;
+               cfg.contains_descriptors = cfg.size > 0;
+            }
+         }
+
+         pan_pack(&res_table[PANVK_HEAP_EMBEDDED_TABLE], RESOURCE, cfg) {
+            cfg.address = panvk_priv_mem_dev_addr(
+               desc_info->embedded_samplers.descs);
+            cfg.size = desc_info->embedded_samplers.count *
+                       PANVK_DESCRIPTOR_SIZE;
+            cfg.contains_descriptors = true;
          }
       }
 
@@ -369,6 +394,68 @@ panvk_per_arch(CmdBindDescriptorSets2KHR)(
       compute_state_set_dirty(cmdbuf, DESC_STATE);
    }
 }
+
+#if PAN_ARCH >= 9
+void
+panvk_per_arch(cmd_bind_desc_heap)(struct panvk_cmd_buffer *cmdbuf,
+                                   uint32_t heap,
+                                   const VkBindHeapInfoEXT *info)
+{
+   /* Heaps are shared by every bind point. */
+   struct panvk_descriptor_state *states[] = {
+      &cmdbuf->state.gfx.desc_state,
+      &cmdbuf->state.compute.desc_state,
+   };
+
+   for (uint32_t i = 0; i < ARRAY_SIZE(states); i++) {
+      states[i]->heaps[heap].addr = info->heapRange.address;
+      states[i]->heaps[heap].size = info->heapRange.size;
+   }
+
+   gfx_state_set_dirty(cmdbuf, DESC_STATE);
+   compute_state_set_dirty(cmdbuf, DESC_STATE);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdBindSamplerHeapEXT)(VkCommandBuffer commandBuffer,
+                                      const VkBindHeapInfoEXT *pBindInfo)
+{
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+
+   panvk_per_arch(cmd_bind_desc_heap)(cmdbuf, PANVK_HEAP_SAMPLER, pBindInfo);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdBindResourceHeapEXT)(VkCommandBuffer commandBuffer,
+                                       const VkBindHeapInfoEXT *pBindInfo)
+{
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+
+   panvk_per_arch(cmd_bind_desc_heap)(cmdbuf, PANVK_HEAP_RESOURCE, pBindInfo);
+}
+
+void
+panvk_per_arch(cmd_inherit_desc_heaps)(struct panvk_cmd_buffer *cmdbuf,
+                                       const VkCommandBufferBeginInfo *info)
+{
+   if (cmdbuf->vk.level != VK_COMMAND_BUFFER_LEVEL_SECONDARY ||
+       !info->pInheritanceInfo)
+      return;
+
+   const VkCommandBufferInheritanceDescriptorHeapInfoEXT *heap_info =
+      vk_find_struct_const(info->pInheritanceInfo->pNext,
+                           COMMAND_BUFFER_INHERITANCE_DESCRIPTOR_HEAP_INFO_EXT);
+   if (!heap_info)
+      return;
+
+   if (heap_info->pSamplerHeapBindInfo)
+      panvk_per_arch(cmd_bind_desc_heap)(cmdbuf, PANVK_HEAP_SAMPLER,
+                                         heap_info->pSamplerHeapBindInfo);
+   if (heap_info->pResourceHeapBindInfo)
+      panvk_per_arch(cmd_bind_desc_heap)(cmdbuf, PANVK_HEAP_RESOURCE,
+                                         heap_info->pResourceHeapBindInfo);
+}
+#endif
 
 static void
 push_desc_set_write(struct panvk_cmd_buffer *cmd,

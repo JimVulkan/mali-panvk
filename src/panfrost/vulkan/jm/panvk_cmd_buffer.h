@@ -60,6 +60,15 @@ struct panvk_batch {
    struct pan_tls_info tlsinfo;
    unsigned wls_total_size;
    bool issued;
+   /* Writes a GPU timestamp: kbase only runs the system timestamp for atoms with
+    * BASE_JD_REQ_PERMON (a WRITE_VALUE SYSTEM_TIMESTAMP stores 0 without it). */
+   bool needs_permon;
+   /* WRITE_VALUE jobs in vtc_jc (panvk_emit_write_job). When they are all of it and there is no
+    * fragment job, the atom can go to the fragment slot instead (gpu_queue). */
+   uint16_t nr_write_jobs;
+   /* kbase: the dev->tiler_heap its tiler context uses, and PANVK_BATCH_* ordering needs. */
+   uint8_t tiler_heap;
+   uint8_t order;
    /* Tessellation: this batch's struct poly_heap header, 0 until its first tessellated draw. */
    uint64_t tess_heap;
    /* Indirect draws, and indexed draws rerouted through them: one index scan and one patch job
@@ -71,6 +80,31 @@ struct panvk_batch {
       struct util_dynarray entries;
    } draw_helper;
 };
+
+/* On kbase, a batch's vertex/tiler atom normally waits only for the one before it and for the
+ * fragment atom that last used its tiler heap, so it runs alongside the previous batch's
+ * fragment atom (jm/panvk_vX_gpu_queue.c). These keep the two apart. */
+/* Its vertex/tiler jobs depend on earlier fragment work: a barrier or event wait with a second
+ * scope before the fragment stages, or device memory the fragment jobs may still use. */
+#define PANVK_BATCH_WAIT_FRAG (1u << 0)
+/* Its fragment jobs use device memory the next batch's vertex/tiler jobs may write. */
+#define PANVK_BATCH_HOLD_FRAG (1u << 1)
+/* Timestamp writes and timestamp pool resets (jm/panvk_vX_cmd_query.c): after all earlier work,
+ * but in line with the fragment atoms, so the next batch's vertex/tiler atom does not wait for
+ * them and still overlaps the previous fragment atom. A pending WAIT_FRAG passes on to the
+ * batch after. */
+#define PANVK_BATCH_FRAG_ORDERED (1u << 2)
+
+/* The largest stack a command buffer keeps once per tiler heap (see cmd_close_batch). */
+#define PANVK_KBASE_SHARED_STACK_MAX (32u * 1024 * 1024)
+
+/* Pipeline stages only fragment jobs run. A dependency whose second scope lies within them is
+ * kept by the fragment jobs' own order. */
+#define PANVK_FRAG_ONLY_STAGES                                                                   \
+   (VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |      \
+    VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |                                                \
+    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT |   \
+    VK_PIPELINE_STAGE_2_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR)
 
 enum panvk_cmd_event_op_type {
    PANVK_EVENT_OP_SET,
@@ -107,12 +141,20 @@ struct panvk_cmd_buffer {
    struct list_head push_sets;
    struct panvk_batch *cur_batch;
 
-   /* kbase: the stack every batch of this command buffer shares, the largest one asked for so
-    * far. kbase runs a device's atoms one after another, so no two batches use it at once. */
+   /* kbase: the stacks the batches of this command buffer share, the largest one asked for so
+    * far, one per tiler heap. Two batches run at once only when their tiler heaps differ (a
+    * fragment atom and the next batch's vertex/tiler atom), so they never share a stack. */
    struct {
       uint64_t ptr;
       unsigned size;
-   } tls_stack;
+   } tls_stack[2];
+
+   /* kbase: a barrier or event wait whose second scope reaches the vertex/tiler jobs was
+    * recorded and no batch has taken it yet (PANVK_BATCH_WAIT_FRAG). Reset with the command
+    * buffer; when still set at the end, the first batch after it in the queue takes it. */
+   bool pending_frag_wait;
+   /* kbase: the tiler heap of the next batch, plus one (0: take the device's turn). */
+   uint8_t next_tiler_heap;
 
    struct {
       struct panvk_cmd_graphics_state gfx;

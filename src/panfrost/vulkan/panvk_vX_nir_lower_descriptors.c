@@ -824,6 +824,12 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct lower_desc_ctx *ctx)
 {
    bool progress = false;
 
+#if PAN_ARCH >= 9
+   /* Already lowered from descriptor heap offsets (lower_heap_tex). */
+   if (nir_tex_instr_src_index(tex, nir_tex_src_texture_handle) >= 0)
+      return false;
+#endif
+
    b->cursor = nir_before_instr(&tex->instr);
 
    /* Remove index for input attachments, since after this pass the index is
@@ -1071,6 +1077,128 @@ lower_intrinsic(nir_builder *b, nir_intrinsic_instr *intr,
       return false;
    }
 }
+
+#if PAN_ARCH >= 9
+/* VK_EXT_descriptor_heap. vk_nir_lower_descriptor_heaps turned every
+ * resource access into a byte offset in the resource or sampler heap. Both
+ * heaps are bound as resource table entries holding 32-byte descriptors, so
+ * a heap offset is a resource handle in that table. */
+static nir_def *
+heap_handle(nir_builder *b, uint32_t table, nir_def *offset_B)
+{
+   return nir_iadd_imm(
+      b, nir_ushr_imm(b, offset_B, util_logbase2(PANVK_DESCRIPTOR_SIZE)),
+      pan_res_handle(table, 0));
+}
+
+static bool
+lower_heap_tex(nir_builder *b, nir_tex_instr *tex)
+{
+   bool progress = false;
+
+   b->cursor = nir_before_instr(&tex->instr);
+
+   for (unsigned i = 0; i < tex->num_srcs; i++) {
+      switch (tex->src[i].src_type) {
+      case nir_tex_src_texture_heap_offset:
+         nir_src_rewrite(&tex->src[i].src,
+                         heap_handle(b, PANVK_HEAP_RESOURCE_TABLE,
+                                     tex->src[i].src.ssa));
+         tex->src[i].src_type = nir_tex_src_texture_handle;
+         progress = true;
+         break;
+      case nir_tex_src_sampler_heap_offset:
+         nir_src_rewrite(&tex->src[i].src,
+                         heap_handle(b, PANVK_HEAP_SAMPLER_TABLE,
+                                     tex->src[i].src.ssa));
+         tex->src[i].src_type = nir_tex_src_sampler_handle;
+         progress = true;
+         break;
+      default:
+         break;
+      }
+   }
+
+   if (!progress)
+      return false;
+
+   /* Entry 0 of the embedded sampler table is a default sampler for the ops
+    * that take none: the texture instructions always need one. */
+   if (nir_tex_instr_src_index(tex, nir_tex_src_sampler_handle) < 0) {
+      uint32_t idx = tex->embedded_sampler ? tex->sampler_index + 1 : 0;
+      nir_tex_instr_add_src(
+         tex, nir_tex_src_sampler_handle,
+         nir_imm_int(b, pan_res_handle(PANVK_HEAP_EMBEDDED_TABLE, idx)));
+      tex->embedded_sampler = false;
+   }
+
+   tex->texture_index = 0;
+   tex->sampler_index = 0;
+   return true;
+}
+
+static bool
+lower_heap_intrinsic(nir_builder *b, nir_intrinsic_instr *intr)
+{
+   b->cursor = nir_before_instr(&intr->instr);
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_heap_descriptor: {
+      /* Buffer descriptors, in the vec2_index_32bit_offset form
+       * build_buffer_addr_for_res_index produces: (handle, array index,
+       * offset). */
+      assert(intr->def.num_components == 3 && intr->def.bit_size == 32);
+      nir_def *handle =
+         heap_handle(b, PANVK_HEAP_RESOURCE_TABLE, intr->src[0].ssa);
+      nir_def_replace(&intr->def,
+                      nir_vec3(b, handle, nir_imm_int(b, 0), nir_imm_int(b, 0)));
+      return true;
+   }
+
+   case nir_intrinsic_load_resource_heap_data: {
+      /* Table 62 exposes the resource table entries as buffers: this reads
+       * the resource heap memory itself. */
+      nir_def *heap = nir_imm_int(
+         b, pan_res_handle(VALHALL_RESOURCE_TABLE_IDX, PANVK_HEAP_RESOURCE_TABLE));
+      nir_def *val = nir_load_ubo(
+         b, intr->def.num_components, intr->def.bit_size, heap,
+         intr->src[0].ssa, .range = ~0u,
+         .align_mul = nir_intrinsic_align_mul(intr),
+         .align_offset = nir_intrinsic_align_offset(intr));
+      nir_def_replace(&intr->def, val);
+      return true;
+   }
+
+   case nir_intrinsic_image_heap_load:
+   case nir_intrinsic_image_heap_sparse_load:
+   case nir_intrinsic_image_heap_store:
+   case nir_intrinsic_image_heap_atomic:
+   case nir_intrinsic_image_heap_atomic_swap:
+   case nir_intrinsic_image_heap_size:
+   case nir_intrinsic_image_heap_samples:
+      nir_rewrite_image_intrinsic(
+         intr, heap_handle(b, PANVK_HEAP_RESOURCE_TABLE, intr->src[0].ssa),
+         nir_image_intrinsic_type_default);
+      return true;
+
+   default:
+      return false;
+   }
+}
+
+static bool
+lower_heap_instr(nir_builder *b, nir_instr *instr, UNUSED void *data)
+{
+   switch (instr->type) {
+   case nir_instr_type_tex:
+      return lower_heap_tex(b, nir_instr_as_tex(instr));
+   case nir_instr_type_intrinsic:
+      return lower_heap_intrinsic(b, nir_instr_as_intrinsic(instr));
+   default:
+      return false;
+   }
+}
+#endif
 
 static bool
 lower_descriptors_instr(nir_builder *b, nir_instr *instr, void *data)
@@ -1467,6 +1595,11 @@ panvk_per_arch(nir_lower_descriptors)(
 
    for (uint32_t i = 0; i < set_layout_count; i++)
       ctx.set_layouts[i] = to_panvk_descriptor_set_layout(set_layouts[i]);
+
+#if PAN_ARCH >= 9
+   NIR_PASS(_, nir, nir_shader_instructions_pass, lower_heap_instr,
+            nir_metadata_control_flow, NULL);
+#endif
 
    NIR_PASS(progress, nir, nir_shader_instructions_pass,
             collect_instr_desc_access, nir_metadata_all, &ctx);

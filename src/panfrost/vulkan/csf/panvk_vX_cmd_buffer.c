@@ -101,7 +101,7 @@ flush_sync_points(struct panvk_cmd_buffer *cmdbuf)
 }
 
 static void
-finish_cs(struct panvk_cmd_buffer *cmdbuf, uint32_t subqueue)
+finish_cs(struct panvk_cmd_buffer *cmdbuf, uint32_t subqueue, bool idle)
 {
    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
    struct cs_builder *b = panvk_get_cs_builder(cmdbuf, subqueue);
@@ -130,24 +130,28 @@ finish_cs(struct panvk_cmd_buffer *cmdbuf, uint32_t subqueue)
    /* We need a clean because descriptor/CS memory can be returned to the
     * command pool where they get recycled. If we don't clean dirty cache lines,
     * those cache lines might get evicted asynchronously and their content
-    * pushed back to main memory after the CPU has written new stuff there. */
-   struct cs_index flush_id = cs_scratch_reg32(b, 0);
+    * pushed back to main memory after the CPU has written new stuff there.
+    * An idle subqueue wrote none of that memory (see EndCommandBuffer). */
+   if (!idle) {
+      struct cs_index flush_id = cs_scratch_reg32(b, 0);
 
-   panvk_per_arch(panvk_instr_begin_work)(subqueue, cmdbuf,
-                                          PANVK_INSTR_WORK_TYPE_FLUSH_CACHE);
-   cs_move32_to(b, flush_id, 0);
-   cs_flush_caches(b, MALI_CS_FLUSH_MODE_CLEAN, MALI_CS_FLUSH_MODE_CLEAN,
-                   MALI_CS_OTHER_FLUSH_MODE_NONE, flush_id,
-                   cs_defer(SB_IMM_MASK, SB_ID(IMM_FLUSH)));
-   cs_wait_slot(b, SB_ID(IMM_FLUSH));
-   struct panvk_instr_end_args instr_info_flush = {
-      .flush_cache = {
-         .l2 = MALI_CS_FLUSH_MODE_CLEAN,
-         .lsc = MALI_CS_FLUSH_MODE_CLEAN,
-         .other = MALI_CS_OTHER_FLUSH_MODE_NONE,
-      }};
-   panvk_per_arch(panvk_instr_end_work)(
-      subqueue, cmdbuf, PANVK_INSTR_WORK_TYPE_FLUSH_CACHE, &instr_info_flush);
+      panvk_per_arch(panvk_instr_begin_work)(subqueue, cmdbuf,
+                                             PANVK_INSTR_WORK_TYPE_FLUSH_CACHE);
+      cs_move32_to(b, flush_id, 0);
+      cs_flush_caches(b, MALI_CS_FLUSH_MODE_CLEAN, MALI_CS_FLUSH_MODE_CLEAN,
+                      MALI_CS_OTHER_FLUSH_MODE_NONE, flush_id,
+                      cs_defer(SB_IMM_MASK, SB_ID(IMM_FLUSH)));
+      cs_wait_slot(b, SB_ID(IMM_FLUSH));
+      struct panvk_instr_end_args instr_info_flush = {
+         .flush_cache = {
+            .l2 = MALI_CS_FLUSH_MODE_CLEAN,
+            .lsc = MALI_CS_FLUSH_MODE_CLEAN,
+            .other = MALI_CS_OTHER_FLUSH_MODE_NONE,
+         }};
+      panvk_per_arch(panvk_instr_end_work)(
+         subqueue, cmdbuf, PANVK_INSTR_WORK_TYPE_FLUSH_CACHE,
+         &instr_info_flush);
+   }
 
    /* If this is a secondary command buffer, we don't poison the reg file to
     * preserve the render pass context. We also don't poison the reg file if the
@@ -237,10 +241,58 @@ finish_queries(struct panvk_cmd_buffer *cmdbuf)
    cs_flush_stores(b);
 }
 
+/* Every CS chunk takes a whole 64K slab, so panvk_pool_flush_maps() would
+ * clean 64K per subqueue even when a few hundred bytes were emitted. A root
+ * chunk only needs its emitted part (root_chunk.size, set by cs_end());
+ * chunks a long CS wrapped into are cleaned whole.
+ */
+static void
+flush_cs_pool(struct panvk_cmd_buffer *cmdbuf)
+{
+   struct panvk_pool *pool = &cmdbuf->cs_pool;
+
+   if (!(pool->props.create_flags & PAN_KMOD_BO_FLAG_WB_MMAP))
+      return;
+
+   list_for_each_entry(struct panvk_priv_bo, bo, &pool->bos, node) {
+      const uint64_t bo_size = pan_kmod_bo_size(bo->bo);
+      uint64_t start = 0, end = bo_size;
+
+      for (uint32_t i = 0; i < ARRAY_SIZE(cmdbuf->state.cs); i++) {
+         const struct cs_builder *b = &cmdbuf->state.cs[i].builder;
+         const uint64_t root = b->root_chunk.buffer.gpu;
+
+         if (root >= bo->addr.dev && root < bo->addr.dev + bo_size) {
+            start = root - bo->addr.dev;
+            end = MIN2(start + (uint64_t)b->root_chunk.size * 8, bo_size);
+            break;
+         }
+      }
+
+      if (end > start)
+         panvk_priv_bo_flush(bo, start, end - start);
+   }
+
+   list_for_each_entry(struct panvk_priv_bo, bo, &pool->big_bos, node)
+      panvk_priv_bo_flush(bo, 0, pan_kmod_bo_size(bo->bo));
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 panvk_per_arch(EndCommandBuffer)(VkCommandBuffer commandBuffer)
 {
    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+
+   /* A subqueue nothing was recorded on (typically compute in a graphics
+    * command buffer) wrote no pool memory, so it can skip the end-of-CS
+    * cache clean. Timestamp queries are signalled from the compute subqueue
+    * by finish_queries(), keep the clean then.
+    */
+   bool idle[ARRAY_SIZE(cmdbuf->state.cs)];
+   for (uint32_t i = 0; i < ARRAY_SIZE(cmdbuf->state.cs); i++) {
+      idle[i] = cs_is_empty(&cmdbuf->state.cs[i].builder) &&
+                !(i == PANVK_QUERY_TS_INFO_SUBQUEUE &&
+                  cmdbuf->state.contains_timestamp_queries);
+   }
 
    /* Finishing queries requires a barrier. We don't want to do that more
     * often than necessary. At the end of a primary is usually enough.
@@ -265,11 +317,11 @@ panvk_per_arch(EndCommandBuffer)(VkCommandBuffer commandBuffer)
          vk_command_buffer_set_error(&cmdbuf->vk,
                                      VK_ERROR_OUT_OF_DEVICE_MEMORY);
       } else {
-         finish_cs(cmdbuf, i);
+         finish_cs(cmdbuf, i, idle[i]);
       }
    }
 
-   panvk_pool_flush_maps(&cmdbuf->cs_pool);
+   flush_cs_pool(cmdbuf);
    panvk_pool_flush_maps(&cmdbuf->desc_pool);
 
    return vk_command_buffer_end(&cmdbuf->vk);
@@ -1008,6 +1060,7 @@ panvk_per_arch(BeginCommandBuffer)(VkCommandBuffer commandBuffer,
    }
 
    panvk_per_arch(cmd_inherit_render_state)(cmdbuf, pBeginInfo);
+   panvk_per_arch(cmd_inherit_desc_heaps)(cmdbuf, pBeginInfo);
 
    if (cmdbuf->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY) {
       const VkCommandBufferInheritanceConditionalRenderingInfoEXT *cond_info =

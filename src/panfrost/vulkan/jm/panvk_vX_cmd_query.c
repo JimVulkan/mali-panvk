@@ -15,6 +15,7 @@
 #include "genxml/gen_macros.h"
 
 #include "panvk_buffer.h"
+#include "panvk_cmd_alloc.h"
 #include "panvk_cmd_buffer.h"
 #include "panvk_cmd_meta.h"
 #include "panvk_cmd_precomp.h"
@@ -61,6 +62,7 @@ panvk_emit_write_job(struct panvk_cmd_buffer *cmd, struct panvk_batch *batch,
    pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_WRITE_VALUE, true, false, 0, 0,
                   &job, false);
    util_dynarray_append(&batch->jobs, job.cpu);
+   batch->nr_write_jobs++;
 }
 
 static struct panvk_batch *
@@ -99,7 +101,24 @@ panvk_emit_clear_queries(struct panvk_cmd_buffer *cmd,
    };
 
    bool had_batch;
-   open_batch(cmd, &had_batch);
+   struct panvk_batch *batch = open_batch(cmd, &had_batch);
+   /* Every write to a timestamp pool is in line with the fragment atoms too, so a reset of one
+    * need not hold back the next batch's geometry (a game resets its timer queries every
+    * frame). */
+   if (!had_batch && pool->vk.query_type == VK_QUERY_TYPE_TIMESTAMP) {
+      batch->order |= PANVK_BATCH_FRAG_ORDERED;
+
+      /* A few stamps: clearing their availability is all a reset needs (an unavailable value
+       * is never returned), and WRITE_VALUE jobs alone let the atom take the fragment slot. */
+      if (!availaible && query_count <= 16) {
+         for (uint32_t i = 0; i < query_count; i++) {
+            panvk_emit_write_job(cmd, batch, MALI_WRITE_VALUE_TYPE_IMMEDIATE_32,
+                                 panvk_query_available_dev_addr(pool, first_query + i), 0);
+         }
+         close_batch(cmd, had_batch);
+         return;
+      }
+   }
    struct panvk_precomp_ctx precomp_ctx = panvk_per_arch(precomp_cs)(cmd);
    panlib_clear_query_result_struct(&precomp_ctx, panlib_1d(query_count),
                                     PANLIB_BARRIER_NONE, push);
@@ -125,10 +144,29 @@ panvk_per_arch(CmdWriteTimestamp2)(VkCommandBuffer commandBuffer,
                                    VkPipelineStageFlags2 stage,
                                    VkQueryPool queryPool, uint32_t query)
 {
-   UNUSED VK_FROM_HANDLE(panvk_cmd_buffer, cmd, commandBuffer);
-   UNUSED VK_FROM_HANDLE(panvk_query_pool, pool, queryPool);
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(panvk_query_pool, pool, queryPool);
 
-   panvk_stub();
+   /* In a batch of its own, after all the work recorded so far whatever the stage, without
+    * holding back the next batch's geometry on kbase (PANVK_BATCH_FRAG_ORDERED). A start of
+    * pipe stamp can therefore land after the geometry that follows it has started: it reads
+    * late, never early. */
+   bool end_sync = cmd->cur_batch != NULL;
+   if (end_sync)
+      panvk_per_arch(cmd_close_batch)(cmd);
+
+   bool had_batch;
+   struct panvk_batch *batch = open_batch(cmd, &had_batch);
+   had_batch |= end_sync;
+   batch->needs_permon = true;
+   batch->order |= PANVK_BATCH_FRAG_ORDERED;
+
+   panvk_emit_write_job(cmd, batch, MALI_WRITE_VALUE_TYPE_SYSTEM_TIMESTAMP,
+                        panvk_query_report_dev_addr(pool, query), 0);
+   panvk_emit_write_job(cmd, batch, MALI_WRITE_VALUE_TYPE_IMMEDIATE_32,
+                        panvk_query_available_dev_addr(pool, query), 1);
+
+   close_batch(cmd, had_batch);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -140,7 +178,24 @@ panvk_per_arch(CmdBeginQueryIndexedEXT)(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(panvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(panvk_query_pool, pool, queryPool);
 
-   /* TODO: transform feedback */
+   /* Transform feedback stream query: a zeroed pair of totals the capture scans of this stream
+    * add to (panlib_xfb_scan), copied into the report at the end. */
+   if (pool->vk.query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT) {
+      struct pan_ptr stats = panvk_cmd_alloc_dev_mem(cmd, desc, 16, 8);
+      if (!stats.gpu)
+         return;
+      memset(stats.cpu, 0, 16);
+      cmd->state.gfx.xfb.query_stats[index & 3] = stats.gpu;
+      return;
+   }
+
+   /* Pipeline statistics are counted on the CPU and written at the end. */
+   if (pool->vk.query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS) {
+      memset(&cmd->state.gfx.stats, 0, sizeof(cmd->state.gfx.stats));
+      cmd->state.gfx.stats.active = true;
+      return;
+   }
+
    assert(index == 0);
 
    bool had_batch;
@@ -183,8 +238,8 @@ panvk_per_arch(CmdEndQueryIndexedEXT)(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(panvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(panvk_query_pool, pool, queryPool);
 
-   /* TODO: transform feedback */
-   assert(index == 0);
+   const bool xfb = pool->vk.query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT;
+   assert(xfb || index == 0);
 
    bool end_sync = cmd->cur_batch != NULL;
 
@@ -196,11 +251,38 @@ panvk_per_arch(CmdEndQueryIndexedEXT)(VkCommandBuffer commandBuffer,
    struct panvk_batch *batch = open_batch(cmd, &had_batch);
    had_batch |= end_sync;
 
+   /* The capture scans ran in earlier batches: copy their totals and set availability. */
+   if (xfb) {
+      const uint64_t stats = cmd->state.gfx.xfb.query_stats[index & 3];
+      cmd->state.gfx.xfb.query_stats[index & 3] = 0;
+      if (stats) {
+         const struct panlib_xfb_query_end_args args = {
+            .stats = stats,
+            .report = panvk_query_report_dev_addr(pool, query),
+            .available = panvk_query_available_dev_addr(pool, query),
+         };
+         struct panvk_precomp_ctx precomp_ctx = panvk_per_arch(precomp_cs)(cmd);
+         panlib_xfb_query_end_struct(&precomp_ctx, panlib_1d(1), PANLIB_BARRIER_NONE, args);
+      }
+      close_batch(cmd, had_batch);
+      return;
+   }
+
    switch (pool->vk.query_type) {
    case VK_QUERY_TYPE_OCCLUSION: {
       cmd->state.gfx.occlusion_query.ptr = 0;
       cmd->state.gfx.occlusion_query.mode = MALI_OCCLUSION_MODE_DISABLED;
       gfx_state_set_dirty(cmd, OQ);
+      break;
+   }
+   case VK_QUERY_TYPE_PIPELINE_STATISTICS: {
+      uint64_t report = panvk_query_report_dev_addr(pool, query);
+      u_foreach_bit(s, pool->vk.pipeline_statistics) {
+         panvk_emit_write_job(cmd, batch, MALI_WRITE_VALUE_TYPE_IMMEDIATE_64, report,
+                              s < PANVK_PIPELINE_STAT_COUNT ? cmd->state.gfx.stats.counts[s] : 0);
+         report += sizeof(struct panvk_query_report);
+      }
+      cmd->state.gfx.stats.active = false;
       break;
    }
    default:

@@ -95,7 +95,7 @@ enum panvk_bc_emu_profile
 panvk_bc_emu_profile(const struct panvk_physical_device *pdev)
 {
    const unsigned arch = pan_arch(pdev->kmod.dev->props.gpu_id);
-   if (arch < 6 || arch > 7 || debug_get_option_no_bc_emu())
+   if (arch < 6 || debug_get_option_no_bc_emu())
       return PANVK_BC_EMU_NONE;
 
    const uint32_t tf = pan_query_compressed_formats(&pdev->kmod.dev->props);
@@ -107,7 +107,8 @@ panvk_bc_emu_profile(const struct panvk_physical_device *pdev)
    if (bc_emu_native_bc13(pdev))
       return (tf & TF_BC13) == TF_BC13 ? PANVK_BC_EMU_BC47 : PANVK_BC_EMU_NONE;
 
-   /* No BC decoder at all (the Exynos 9820's G76): everything goes through ASTC and EAC. */
+   /* No BC decoder at all (the G76 of the Exynos 9820, the G68 of the s5e8835): everything goes
+    * through ASTC and EAC. */
    return (tf & TF_ASTC) ? PANVK_BC_EMU_ALL : PANVK_BC_EMU_NONE;
 }
 
@@ -392,6 +393,8 @@ panvk_bc_emu_device_init(struct panvk_device *dev)
    list_inithead(&dev->bc_emu.linear_images);
    dev->bc_emu.refresh_pool = VK_NULL_HANDLE;
    memset(dev->bc_emu.refresh, 0, sizeof(dev->bc_emu.refresh));
+   memset(dev->bc_emu.refresh_group, 0, sizeof(dev->bc_emu.refresh_group));
+   memset(dev->bc_emu.refresh_seq, 0, sizeof(dev->bc_emu.refresh_seq));
    dev->bc_emu.refresh_next = 0;
    simple_mtx_init(&dev->bc_emu.lock, mtx_plain);
    dev->bc_emu.buffer = VK_NULL_HANDLE;
@@ -436,9 +439,20 @@ bc_emu_delist(struct panvk_device *dev, struct panvk_image *img)
 {
    list_del(&img->bc_emu.link);
    img->bc_emu.listed = false;
-   if (img->bc_emu.seq && pan_kmod_dev_is_kbase(dev->kmod.dev))
-      pan_kmod_kbase_wait_seq(dev->kmod.dev, img->bc_emu.seq);
+   panvk_bc_emu_wait(dev, img->bc_emu.group, img->bc_emu.seq);
+   img->bc_emu.group = NULL;
    img->bc_emu.seq = 0;
+}
+
+void
+panvk_bc_emu_wait(struct panvk_device *dev, struct pan_kmod_kbase_csf_group *group, uint64_t seq)
+{
+   if (!seq || !pan_kmod_dev_is_kbase(dev->kmod.dev))
+      return;
+   if (group)
+      pan_kmod_kbase_csf_wait(group, seq, INT64_MAX);
+   else
+      pan_kmod_kbase_wait_seq(dev->kmod.dev, seq);
 }
 
 void

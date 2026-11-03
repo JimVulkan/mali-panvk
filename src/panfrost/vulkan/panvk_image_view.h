@@ -26,7 +26,9 @@ struct panvk_image_view {
 
    struct pan_image_view pview;
 
+   /* Texture payloads the descriptors below point at. */
    struct panvk_priv_mem mem;
+   uint32_t mem_size;
 
    struct {
       union {

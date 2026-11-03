@@ -171,6 +171,17 @@ pan_mod_afbc_init_slice_layout(
    slayout->afbc.surface_stride_B = surf_stride_B;
    slayout->size_B = surf_stride_B * mip_extent_px.depth;
 
+   /* XCLIPSE: the producer of an import may put the body further out than Mesa does (ARM's
+    * gralloc: on a 1 KB boundary on MediaTek, 4 KB on Exynos, where Mesa takes 128 bytes).
+    * Reads follow the header offsets, but the plane size in the texture descriptor bounds them:
+    * Mesa's size ends short of the producer's body and its last superblocks read back as zero
+    * (G1-Ultra, 32x8 split). So cover the producer's whole plane when its size is known. */
+   if (use_explicit_layout && mip_extent_px.depth == 1 &&
+       layout_constraints->wsi_plane_size_B > slayout->size_B) {
+      slayout->afbc.surface_stride_B = layout_constraints->wsi_plane_size_B;
+      slayout->size_B = layout_constraints->wsi_plane_size_B;
+   }
+
    if (hdr_surf_size_B > UINT32_MAX)
       return false;
 

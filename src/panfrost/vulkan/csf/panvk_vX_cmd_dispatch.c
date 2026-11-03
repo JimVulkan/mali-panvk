@@ -345,6 +345,8 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
    if (!panvk_priv_mem_check_alloc(cs->spd))
       return;
 
+   panvk_stats_add_dispatch(cmdbuf, cs, info);
+
    const struct panvk_shader_desc_info *cs_desc_info =
       &cmdbuf->state.compute.shader->desc_info;
    struct panvk_descriptor_state *desc_state =

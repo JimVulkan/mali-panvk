@@ -46,8 +46,8 @@ C11 threads and time emulation (src/c11)
    Copyright 2022 Yonggang Luo
    License: BSL-1.0
 
-Android Open Source Project headers (libutils, libhidl, libfmq, libbinder_ndk, libgralloctypes,
-and headers generated from the graphics HAL interfaces), whose inline code the IMapper 4.0
+Android Open Source Project headers (libui, libutils, libcutils, liblog, libhidl, libfmq,
+libbinder_ndk, and headers generated from the graphics HAL interfaces), whose inline code the
 gralloc backend compiles in
    Copyright The Android Open Source Project
    License: Apache-2.0
