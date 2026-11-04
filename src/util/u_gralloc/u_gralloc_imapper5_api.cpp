@@ -15,6 +15,8 @@
 #include <ui/GraphicBufferMapper.h>
 
 #include <system/window.h>
+#include <dlfcn.h>
+#include <new>
 #include <string.h>
 #include <unistd.h>
 
@@ -32,11 +34,91 @@ using android::GraphicBufferMapper;
 using android::OK;
 using android::status_t;
 
+/* XCLIPSE: libui is opened at run time, not linked. AdrenoTools (Winlator, Bannerlator) loads
+ * the driver in the vendor driver's linker namespace, where libui.so is not visible, and a
+ * NEEDED entry on it made the whole driver fail to load there. Without it this backend is
+ * skipped and the handle parsers (u_gralloc_fallback.c) describe the buffers instead.
+ *
+ * The methods are plain (non-virtual) members, so each is called through its exported symbol
+ * with the object as the first argument, which is how AArch64 passes "this". get() is an inline
+ * Singleton in the header; libui exports the singleton's lock and instance, so it is redone
+ * here the same way. */
+struct libui_api {
+   GraphicBufferMapper *mapper;
+   status_t (*getPixelFormatFourCC)(GraphicBufferMapper *, buffer_handle_t, uint32_t *);
+   status_t (*getPixelFormatModifier)(GraphicBufferMapper *, buffer_handle_t, uint64_t *);
+   status_t (*getAllocationSize)(GraphicBufferMapper *, buffer_handle_t, uint64_t *);
+   status_t (*getLayerCount)(GraphicBufferMapper *, buffer_handle_t, uint64_t *);
+   status_t (*getPlaneLayouts)(GraphicBufferMapper *, buffer_handle_t, std::vector<PlaneLayout> *);
+   status_t (*getChromaSiting)(GraphicBufferMapper *, buffer_handle_t, ChromaSiting *);
+   status_t (*getDataspace)(GraphicBufferMapper *, buffer_handle_t, Dataspace *);
+};
+
+static libui_api ui;
+
+static bool
+libui_open(void)
+{
+   void *lib = dlopen("libui.so", RTLD_NOW | RTLD_LOCAL);
+   if (!lib) {
+      mesa_logi("libui.so is not visible here (%s); using the gralloc handle parsers", dlerror());
+      return false;
+   }
+
+#define UI_SYM(field, name)                                                                    \
+   *(void **)&ui.field = dlsym(lib, name);                                                     \
+   if (!ui.field)                                                                              \
+      goto missing;
+
+   UI_SYM(getPixelFormatFourCC, "_ZN7android19GraphicBufferMapper20getPixelFormatFourCCEPK13native_handlePj");
+   UI_SYM(getPixelFormatModifier, "_ZN7android19GraphicBufferMapper22getPixelFormatModifierEPK13native_handlePm");
+   UI_SYM(getAllocationSize, "_ZN7android19GraphicBufferMapper17getAllocationSizeEPK13native_handlePm");
+   UI_SYM(getLayerCount, "_ZN7android19GraphicBufferMapper13getLayerCountEPK13native_handlePm");
+   UI_SYM(getPlaneLayouts,
+          "_ZN7android19GraphicBufferMapper15getPlaneLayoutsEPK13native_handlePNSt3__16vectorIN4aidl7android8"
+          "hardware8graphics6common11PlaneLayoutENS4_9allocatorISB_EEEE");
+   UI_SYM(getChromaSiting,
+          "_ZN7android19GraphicBufferMapper15getChromaSitingEPK13native_handlePN4aidl7android8hardware8graphics6"
+          "common12ChromaSitingE");
+   UI_SYM(getDataspace,
+          "_ZN7android19GraphicBufferMapper12getDataspaceEPK13native_handlePNS_8hardware8graphics6common4V1_29"
+          "DataspaceE");
+#undef UI_SYM
+
+   {
+      auto *lock = (android::Mutex *)dlsym(lib, "_ZN7android9SingletonINS_19GraphicBufferMapperEE5sLockE");
+      auto **instance =
+         (GraphicBufferMapper **)dlsym(lib, "_ZN7android9SingletonINS_19GraphicBufferMapperEE9sInstanceE");
+      void (*ctor)(GraphicBufferMapper *);
+      *(void **)&ctor = dlsym(lib, "_ZN7android19GraphicBufferMapperC1Ev");
+      if (!lock || !instance || !ctor)
+         goto missing;
+
+      lock->lock();
+      if (!*instance) {
+         /* Room to spare: a newer libui's object may be larger than this header's. */
+         void *mem = ::operator new(sizeof(GraphicBufferMapper) < 256 ? 256 : sizeof(GraphicBufferMapper));
+         memset(mem, 0, sizeof(GraphicBufferMapper) < 256 ? 256 : sizeof(GraphicBufferMapper));
+         ctor((GraphicBufferMapper *)mem);
+         *instance = (GraphicBufferMapper *)mem;
+      }
+      ui.mapper = *instance;
+      lock->unlock();
+   }
+   return true;
+
+missing:
+   mesa_logw("libui.so lacks a GraphicBufferMapper symbol; using the gralloc handle parsers");
+   memset(&ui, 0, sizeof(ui));
+   dlclose(lib);
+   return false;
+}
+
 static std::optional<std::vector<PlaneLayout>>
 GetPlaneLayouts(const native_handle_t *buffer)
 {
    std::vector<PlaneLayout> plane_layouts;
-   status_t  error = GraphicBufferMapper::get().getPlaneLayouts(buffer, &plane_layouts);
+   status_t  error = ui.getPlaneLayouts(ui.mapper, buffer, &plane_layouts);
 
    if (error != OK)
       return std::nullopt;
@@ -70,22 +152,22 @@ mapper5_query_buffer_basic_info(struct u_gralloc *gralloc,
       return -EINVAL;
 
    uint32_t drm_fourcc;
-   status_t error = GraphicBufferMapper::get().getPixelFormatFourCC(hnd->handle, &drm_fourcc);
+   status_t error = ui.getPixelFormatFourCC(ui.mapper, hnd->handle, &drm_fourcc);
    if (error != OK)
       return -EINVAL;
 
    uint64_t modifier;
-   error = GraphicBufferMapper::get().getPixelFormatModifier(hnd->handle,&modifier);
+   error = ui.getPixelFormatModifier(ui.mapper, hnd->handle, &modifier);
    if (error != OK)
       return  -EINVAL;
 
    uint64_t alloc_size;
-   error = GraphicBufferMapper::get().getAllocationSize(hnd->handle, &alloc_size);
+   error = ui.getAllocationSize(ui.mapper, hnd->handle, &alloc_size);
    if (error != OK)
       return -EINVAL;
 
    uint64_t layer_count;
-   error = GraphicBufferMapper::get().getLayerCount(hnd->handle, &layer_count);
+   error = ui.getLayerCount(ui.mapper, hnd->handle, &layer_count);
    if (error != OK)
       return -EINVAL;
 
@@ -176,12 +258,12 @@ mapper5_get_buffer_color_info(struct u_gralloc *gralloc,
 
    /* optional attributes */
    ChromaSiting chroma_siting;
-   status_t error = GraphicBufferMapper::get().getChromaSiting(hnd->handle, &chroma_siting);
+   status_t error = ui.getChromaSiting(ui.mapper, hnd->handle, &chroma_siting);
    if (error != OK)
       return  -EINVAL;
 
    Dataspace dataspace;
-   error = GraphicBufferMapper::get().getDataspace(hnd->handle, &dataspace);
+   error = ui.getDataspace(ui.mapper, hnd->handle, &dataspace);
    if (error != OK)
       return  -EINVAL;
 
@@ -270,7 +352,9 @@ destroy(struct u_gralloc *gralloc)
 struct u_gralloc *
 u_gralloc_imapper_api_create()
 {
-   auto &mapper = GraphicBufferMapper::get();
+   if (!ui.mapper && !libui_open())
+      return NULL;
+   auto &mapper = *ui.mapper;
    if(mapper.getMapperVersion() < GraphicBufferMapper::GRALLOC_4) {
       mesa_logi("Could not find IMapper v4/v5 API");
       return NULL;

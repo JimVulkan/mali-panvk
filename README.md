@@ -60,10 +60,11 @@ build therefore needs their headers and something to link against:
   names and symbols (`android/gralloc/stubs.txt`, `mkstubs.py`), and the driver links against
   those. On the phone, Android loads its own libraries.
 
-The driver then needs `libui.so`, `libutils.so`, `libcutils.so`, `liblog.so`, `libnativewindow.so`
-and the platform `libc++.so` at run time. Every Android 12+ phone has them, but a loader that
-keeps the driver in an app's own linker namespace may not let it see them. `GRALLOC=0 ./build.sh`
-builds without the gralloc backend, using only the handle readers.
+The driver links against `liblog.so`, `libnativewindow.so` and the platform `libc++.so`, which
+every Android 12+ phone has. `libui.so` is not linked: the driver opens it at run time, so it
+still loads in launchers that keep it in the vendor driver's linker namespace (AdrenoTools,
+Bannerlator, Winlator), where libui is not visible. There it uses the handle readers.
+`GRALLOC=0 ./build.sh` builds without the gralloc backend at all.
 
 ## Requirements
 
