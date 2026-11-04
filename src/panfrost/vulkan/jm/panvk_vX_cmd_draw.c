@@ -737,7 +737,7 @@ panvk_draw_prepare_varyings(struct panvk_cmd_buffer *cmdbuf,
       if (in_from_cpu) {
          struct pan_ptr ip = panvk_cmd_alloc_dev_mem(cmdbuf, desc, 48, 64);
          if (ip.gpu) {
-            /* CLIP space: the emulation's input is (vs_keep_clip_space). On the probe's 64x64
+            /* CLIP space: the emulation's input is (vs_keep_clip_space). On a 64x64
              * target this is (4,60) (60,60) (32,4) in pixels. */
             static const float tri[3][4] = {
                {-0.875f, 0.875f, 0.5f, 1.0f},
@@ -767,7 +767,7 @@ panvk_draw_prepare_varyings(struct panvk_cmd_buffer *cmdbuf,
       if (gs_pos_cpu && cpufill_mode && out_verts >= 3) {
          /* SCREEN SPACE, not NDC: nir_lower_viewport_transform (bifrost_nir.c) rewrites the
           * vertex shader's gl_Position into screen-space xyz with w = 1/w, so that is what the
-          * tiler expects to find here. The probe's attachment is 64x64. */
+          * tiler expects to find here. The values are for a 64x64 attachment. */
          static const float tri[3][4] = {
             {4.0f, 60.0f, 0.5f, 1.0f},
             {60.0f, 60.0f, 0.5f, 1.0f},
@@ -1833,7 +1833,7 @@ prepare_draw_layer(struct panvk_cmd_buffer *cmdbuf,
  * as the CPU wrote them instead of as the helper patched them, the tiler drew only the indices
  * that had landed -- and every one of those failures came from the same place: memory allocated
  * without BASE_MEM_COHERENT_LOCAL, on which the GPU's own units do not see one another's writes
- * (kbase_kmod.c). With that bit set, every matrix in probe/mali passes on Mali-G76 and Mali-G72
+ * (kbase_kmod.c). With that bit set, every draw test passes on Mali-G76 and Mali-G72
  * with no flush job at all, and a job dependency orders memory as it does for the vendor.
  * PANVK_FLUSH_JOBS=1 puts them back, for A/B only.
  */

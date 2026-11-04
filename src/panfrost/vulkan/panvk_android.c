@@ -404,7 +404,7 @@ panvk_android_allocate_ahb_memory(VkDevice device,
  * On ARM's own gralloc (the kbase stack: Exynos Mali phones), a GPU render + composer buffer
  * of screen size comes back AFBC-compressed, in a layout the allocator does not describe
  * anywhere a driver can read it. MALI_GRALLOC_USAGE_NO_AFBC, gralloc's first private usage bit,
- * makes it linear instead -- measured with probe/mali/ahbdump.c, as is CPU read usage, which
+ * makes it linear instead -- measured, as is CPU read usage, which
  * would cost more. A DRM-backed device has a different allocator and gets the common usage.
  *
  * MediaTek's allocator (Galaxy A31) ignores NO_AFBC: a render + texture buffer, which is what a

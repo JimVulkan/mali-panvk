@@ -492,7 +492,7 @@ vk_android_init_deferred_image(struct vk_device *device,
 /* Xclipse (ro.hardware.vulkan = samsung): Samsung's gralloc gives a buffer whose usage is GPU-only
  * a compressed, tiled layout (handle data[38] = 2) that only the vendor driver understands. What we
  * write there reads back black to every other user, and what they write reads back as garbage to
- * us (probe/gfx/ahbx on the 530 and 940; the 920 does it for composer buffers). One CPU usage bit
+ * us (measured on the 530 and 940; the 920 does it for composer buffers). One CPU usage bit
  * makes gralloc allocate it linear. Applied to swapchain images and to AHBs we allocate. Default on;
  * MESA_GRALLOC_LINEAR=0 / setprop debug.mesa_gralloc_linear 0 turns it off. */
 static bool

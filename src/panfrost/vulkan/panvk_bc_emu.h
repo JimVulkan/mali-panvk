@@ -19,7 +19,7 @@
  * (src/compiler/glsl/bc_decoder.glsl, shared with RADV) fills it after every copy into the image.
  * Plane 0 keeps the blocks the app wrote, so copies out of the image return them unchanged.
  *
- * Two kinds of part, measured (probe/mali/malibcn.c, malicarrier.c, astcmode.c):
+ * Two kinds of part, measured on the devices:
  *
  *  BC1-BC3 in hardware (Mali-G52, MediaTek G76): BC4-BC7 only
  *    BC4_UNORM -> BC3 (the BC4 block is BC3's alpha half; the view swizzles R <- A)

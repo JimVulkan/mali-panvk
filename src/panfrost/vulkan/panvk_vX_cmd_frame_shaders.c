@@ -365,6 +365,11 @@ fill_textures(struct panvk_cmd_buffer *cmdbuf,
       }
 
       struct pan_image_view pview = *iview;
+      /* A cube view bound as a layered attachment is loaded face by face, as array layers. A
+       * cube descriptor counts cubes, so faces 1-5 of one cube were out of bounds and loaded
+       * as zero (G76 and G720; the vendor driver keeps them). */
+      if (pview.dim == MALI_TEXTURE_DIMENSION_CUBE)
+         pview.dim = MALI_TEXTURE_DIMENSION_2D;
       if (loc == FRAG_RESULT_DEPTH)
          pview.format = util_format_get_depth_only(pview.format);
       else if (loc == FRAG_RESULT_STENCIL)

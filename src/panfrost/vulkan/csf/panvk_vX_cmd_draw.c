@@ -4953,7 +4953,10 @@ invalidate_initial_attachment_crcs(struct panvk_cmd_buffer *cmdbuf,
          vk_find_struct_const(att->pNext,
                               RENDERING_ATTACHMENT_INITIAL_LAYOUT_INFO_MESA);
 
-      if (!initial || initial->initialLayout != VK_IMAGE_LAYOUT_PREINITIALIZED)
+      /* UNDEFINED: the memory may have been written through an alias, see
+       * image_barrier_invalidates_crc. */
+      if (!initial || (initial->initialLayout != VK_IMAGE_LAYOUT_PREINITIALIZED &&
+                       initial->initialLayout != VK_IMAGE_LAYOUT_UNDEFINED))
          continue;
 
       VK_FROM_HANDLE(panvk_image_view, iview, att->imageView);
@@ -5204,7 +5207,8 @@ cmd_run_fullscreen(struct panvk_cmd_buffer *cmdbuf, uint64_t dcd,
 
       cs_add_imm64(b, tiler_ctx_tmp, tiler_ctx_addr, 0);
 
-      set_run_fullscreen_tiler_flags(b, MAX_LAYERS_PER_TILER_DESC, 0);
+      /* Arch < 14 selects layers through the view mask: every layer of a full TD. */
+      set_run_fullscreen_tiler_flags(b, 0, BITFIELD_MASK(MAX_LAYERS_PER_TILER_DESC));
 
       cs_while(b, MALI_CS_CONDITION_GREATER, td_count) {
          cs_add_imm32(b, td_count, td_count, -1);

@@ -76,7 +76,7 @@ largest_handle_fd(const native_handle_t *handle)
 #define SEC_HND_HEIGHT       31
 #define SEC_HND_STRIDE       35 /* pixels */
 #define SEC_HND_ALLOC_FORMAT 37 /* HAL format actually allocated */
-#define SEC_HND_LAYOUT       38 /* 1 linear, 2 compressed tiling (probe/gfx/grhandle, ahbx) */
+#define SEC_HND_LAYOUT       38 /* 1 linear, 2 compressed tiling */
 #define SEC_HND_NUM_PLANES   39
 #define SEC_HND_PLANE0       41 /* per plane: size, offset, byte stride, alloc width, alloc height */
 #define SEC_HND_PLANE_INTS   10
@@ -221,11 +221,11 @@ fallback_gralloc_get_yuv_info(struct u_gralloc *gralloc,
 
 /*
  * ARM's mali gralloc private handle, as the Exynos 9820 (Android 12) and 9611 (Android 13)
- * allocators hand it out behind IMapper 2.x, which offers no layout query. Measured with
- * probe/mali/ahbdump.c: indices are into native_handle_t::data[], fds included, 64-bit fields
+ * allocators hand it out behind IMapper 2.x, which offers no layout query. Measured from the
+ * handles themselves: indices are into native_handle_t::data[], fds included, 64-bit fields
  * as low/high int pairs. The byte stride is the allocator's own (a 65x33 buffer is 80x48), and
  * a linear buffer starts at offset 0 of the dma-buf, both confirmed by the vendor driver
- * rendering into such a buffer and the pixels read back through the dma-buf (probe/mali/vkanb.c).
+ * rendering into such a buffer and the pixels read back through the dma-buf.
  */
 #define ARM_GRALLOC_MAGIC        0x03141592
 /* Offsets from the magic, which is data[5] on the Exynos handles. MediaTek's allocator (Galaxy
@@ -255,9 +255,9 @@ enum { ARM_HND_EXYNOS, ARM_HND_MTK, ARM_HND_MTK2 };
  * 8x8 (so 128x128-pixel aligned), YUV transform and sparse bodies, the header at offset 0 and the
  * body right after it on a 4 KB boundary. That is the layout Mesa computes for the equivalent DRM
  * modifier, and the plane stride is the uncompressed byte stride of the aligned width, which is
- * what the AFBC import takes as its row pitch. Read off probe/mali/ahbdump.c at 16x16 to
- * 1920x1080 and checked pixel for pixel in both directions against the vendor GLES driver
- * (probe/mali/vkafbc.c). Only this combination, and only RGBA/RGBX 8888, is taken as AFBC.
+ * what the AFBC import takes as its row pitch. Read off the handles at 16x16 to
+ * 1920x1080 and checked pixel for pixel in both directions against the vendor GLES driver.
+ * Only this combination, and only RGBA/RGBX 8888, is taken as AFBC.
  * A BGRA 8888 request is stored as RGBA AFBC (alloc format 0x311_00000001), so it is reported
  * as RGBA, which is also the Vulkan format the vendor driver gives such a buffer. */
 #define ARM_MTK_AFBC_ALLOC_BITS  0x311u
@@ -265,7 +265,7 @@ enum { ARM_HND_EXYNOS, ARM_HND_MTK, ARM_HND_MTK2 };
  * format 0x1_<hal format>: 16x16 superblocks, untiled headers, no YUV transform, the plane stride
  * that of the 16-aligned width. Its body starts at the header size rounded up to 4 KB where Mesa
  * uses 128 bytes; readers follow the header's offsets and Mesa's body ends inside the buffer, so
- * that does not matter. Checked like the MediaTek layout (probe/mali/vkafbc.c): 16x16 + sparse
+ * that does not matter. Checked like the MediaTek layout: 16x16 + sparse
  * passes both directions, with YUV transform every pixel is wrong. A BGRA 8888 buffer is stored in
  * RGBA component order here too (alloc format 0x1_00000005), as the vendor driver reports it. */
 #define ARM_EXYNOS_AFBC_ALLOC_BITS 0x1u
@@ -273,7 +273,7 @@ enum { ARM_HND_EXYNOS, ARM_HND_MTK, ARM_HND_MTK2 };
  * IMapper5 reports the modifier of the two alloc formats GPU-only buffers get: 0x0c410000_<hal>
  * (usage 0x300, 0xa00) is 16x16 tiled, YUV transform, sparse, solid color; 0x0c310000_<hal>
  * (usage 0xb00) is 32x8 split, YUV transform, sparse. Both checked against the vendor GLES driver
- * with probe/mali/vkafbc.c at 32x16 to 1920x1080. CPU-usage buffers have alloc format 0. */
+ * at 32x16 to 1920x1080. CPU-usage buffers have alloc format 0. */
 #define ARM_MTK2_AFBC_16X16_BITS 0x0c410000u
 #define ARM_MTK2_AFBC_32X8_BITS  0x0c310000u
 

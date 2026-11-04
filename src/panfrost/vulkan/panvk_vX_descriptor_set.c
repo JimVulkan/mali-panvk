@@ -123,7 +123,7 @@ write_nulldesc_v7(struct panvk_descriptor_set *set, uint32_t binding, uint32_t e
    default:
       /* The 4 KB of zeroes as a UBO: a null UBO only has to read zeros. Not a 0-entry UBO: a
        * pointer 0 read-faults the job, and 0 entries at a mapped pointer made the job end
-       * TERMINATED (measured, probe/mali/robust/vkrobust.c). */
+       * TERMINATED (measured). */
       pan_pack((struct mali_uniform_buffer_packed *)zero, UNIFORM_BUFFER, cfg) {
          cfg.pointer = dev->null_descs.zero_addr;
          cfg.entries = 4096 / 16;

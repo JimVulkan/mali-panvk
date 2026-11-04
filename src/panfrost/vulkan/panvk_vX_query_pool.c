@@ -5,6 +5,7 @@
  */
 
 #include "util/macros.h"
+#include "util/os_time.h"
 #include "vk_log.h"
 
 #include "pan_props.h"
@@ -171,6 +172,11 @@ panvk_query_wait_for_available(struct panvk_device *dev,
                                struct panvk_query_pool *pool, uint32_t query)
 {
    int64_t abs_timeout_ns = os_time_get_absolute_timeout(PANVK_QUERY_TIMEOUT);
+   /* The availability word is written by the GPU and nothing wakes the CPU for it. Spin
+    * briefly for the common short wait, then sleep with a growing step (up to 1 ms) so a
+    * long wait does not keep a core busy (and the SoC hot) for the whole frame. */
+   unsigned spins = 0;
+   int64_t sleep_us = 20;
 
    while (os_time_get_nano() < abs_timeout_ns) {
       if (panvk_query_is_available(pool, query))
@@ -179,6 +185,11 @@ panvk_query_wait_for_available(struct panvk_device *dev,
       VkResult status = vk_device_check_status(&dev->vk);
       if (status != VK_SUCCESS)
          return status;
+
+      if (++spins > 64) {
+         os_time_sleep(sleep_us);
+         sleep_us = MIN2(sleep_us * 2, 1000);
+      }
    }
 
    return vk_device_set_lost(&dev->vk, "query timeout");

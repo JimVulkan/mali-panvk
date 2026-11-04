@@ -74,7 +74,7 @@ panvk_cmd_prepare_fragment_job(struct panvk_cmd_buffer *cmdbuf, uint64_t fbd)
  * order, and a tiler job waits for its vertex job, so in the plain order the GPU ran one job at
  * a time; this way a vertex job runs while the previous draw tiles. 2000 small draws on Mali-G76
  * went from 7.3 to 3.9 ms a frame (the vendor driver: 2.8-3.4). The tiler jobs stay in draw
- * order, which is what orders the draws (probe/mali/bench BENCH_ORDER hashes the same, and as
+ * order, which is what orders the draws (the rendered frames hash the same, and as
  * the vendor's). Anything else added to the chain flushes them first; keep is how many may
  * stay pending.
  */

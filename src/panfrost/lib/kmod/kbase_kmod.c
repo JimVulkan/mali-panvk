@@ -15,7 +15,7 @@
  * (an LD_PRELOAD spy around a real Vulkan workload) and diffing each payload before and after
  * the call, so input fields, output fields and padding separate themselves without anyone
  * deciding what a struct looks like. Three names in the public tables were WRONG for this DDK
- * and the traffic overruled them; they are marked below. See probe/mali/UAPI_NOTES.md.
+ * and the traffic overruled them; they are marked below.
  *
  * WHY THE MODEL FITS. kbase assigns the GPU VA at allocation time and offers no userspace VA
  * management -- and neither does DRM panfrost, whose backend refuses anything but
@@ -99,7 +99,7 @@ struct kbase_ioctl_mem_exec_init {
 /* nr 0/1/3/5 are as the public tables have them. nr 7 (MEM_FREE) never appeared in the captured
  * traffic -- the workload never freed anything -- so it was measured directly instead: it
  * SUCCEEDS on an exec-zone allocation and is refused, EINVAL, for every SAME_VA one, mapped or
- * not. That is not a bug in the number; it is the model. See probe/mali/maliva.c. */
+ * not. That is not a bug in the number; it is the model. */
 #define KBASE_IOCTL_VERSION_CHECK _IOWR(KBASE_IOCTL_TYPE, 0, struct kbase_ioctl_version_check)
 #define KBASE_IOCTL_CSF_VERSION_CHECK                                                             \
    _IOWR(KBASE_IOCTL_TYPE, 52, struct kbase_ioctl_version_check)
@@ -123,7 +123,7 @@ struct kbase_ioctl_mem_jit_init {
 
 /* nr 22, a dma-buf (UMM) import: phandle points at the fd. The shape is kbase's public one; the
  * vendor could not be spied importing (its ICD loads in the sphal namespace, out of LD_PRELOAD's
- * reach), so what settles it is probe/mali/vkanb.c reading the rendered pixels back through the
+ * reach), so what settles it is reading the rendered pixels back through the
  * dma-buf. Like MEM_ALLOC, a SAME_VA import returns a cookie, and the anchor mapping of that
  * cookie is the GPU VA. */
 union kbase_ioctl_mem_import {
@@ -374,9 +374,8 @@ kbase_kmod_query_props(int fd, struct pan_kmod_dev_props *props, uint32_t *js0_f
    *js0_features = P(RAW_JS_FEATURES_0, 0);
 
    props->texture_features[0] = P(TEXTURE_FEATURES_0, 0);
-   /* PROBE ONLY: OR extra compressed-format bits into what the GPU reports, to ask the texture
-    * unit directly whether it decodes a format its feature register leaves out
-    * (probe/mali/malibcn.c). */
+   /* DEBUG ONLY: OR extra compressed-format bits into what the GPU reports, to ask the texture
+    * unit directly whether it decodes a format its feature register leaves out. */
    const char *texfeat_or = getenv("PANVK_TEXFEAT0_OR");
    if (texfeat_or)
       props->texture_features[0] |= (uint32_t)strtoul(texfeat_or, NULL, 0);
@@ -522,7 +521,7 @@ kbase_kmod_dev_create(int fd, uint32_t flags, const struct pan_kmod_allocator *a
       /* CSF: the kernel's own allocations for this context (tiler heap contexts and chunks)
        * come from the CUSTOM_VA zone, which a 64-bit context only has once JIT is initialised:
        * kbase carves it out of SAME_VA then. Without it CS_TILER_HEAP_INIT is ENOMEM for any
-       * parameters (probe/mali/csfheap.c). It must come before the first allocation. */
+       * parameters (measured). It must come before the first allocation. */
       if (vc.major == 1) {
          struct kbase_ioctl_mem_jit_init jit = {
             .va_pages = KBASE_CSF_JIT_VA_PAGES,
@@ -609,7 +608,7 @@ kbase_kmod_dev_query_user_va_range(const struct pan_kmod_dev *dev)
  *     flags 0x17   -> 0x0000007f00001000
  *
  * A value that repeats across allocations of different sizes is not an address. 0x41000 is a
- * COOKIE. The measurement that settles it is MEM_QUERY (probe/mali/maliva.c): the kernel does
+ * COOKIE. The measurement that settles it is MEM_QUERY: the kernel does
  * not recognise 0x41000 as a region, and DOES recognise the address the subsequent mmap
  * returned. So for an ordinary allocation:
  *
@@ -1380,7 +1379,7 @@ pan_kmod_kbase_sync_provider(void)
  * asked for nothing at all. The only reason it was not mistaken for a working driver is that
  * the readback was verified. Nothing here may rely on an ioctl return alone.
  *
- * WHAT SUBMISSION LOOKS LIKE, read off the vendor rendering a triangle (probe/mali/glprobe2.c):
+ * WHAT SUBMISSION LOOKS LIKE, read off the vendor rendering a triangle:
  * one JOB_SUBMIT carrying an array of 64-byte atoms, and completion reported by READING the
  * device fd -- 24-byte records, not a fence. The atom layout below is pinned by an unusually
  * strong check: the two udata words we put in an atom came back BYTE-IDENTICAL in that atom's
@@ -2027,8 +2026,7 @@ pan_kmod_kbase_unmap_repeated(struct pan_kmod_bo *bo, uint64_t va, unsigned coun
  * as queue GROUPS of up to eight queues, each queue a ring in our own memory plus two pages the
  * firmware and we share (CS_INSERT/CS_EXTRACT_INIT in, CS_EXTRACT/CS_ACTIVE out), and a KICK
  * ioctl that has the kernel scheduler put the group on a slot. Everything panthor's kernel does
- * between a GROUP_SUBMIT and the ring is done here instead, measured first with
- * probe/mali/csfhello.c and probe/mali/csfring.c:
+ * between a GROUP_SUBMIT and the ring is done here instead, measured first on the device:
  *
  *   per call:  MOVE32 flush_id=0; FLUSH_CACHE2 clean+invalidate; MOVE48/MOVE32 stream; WAIT;
  *              CALL

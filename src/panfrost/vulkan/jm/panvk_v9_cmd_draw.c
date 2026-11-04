@@ -2283,7 +2283,7 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, const struct panvk_draw_info *dr
             return;
       } else {
          /* Not chained to the previous draw's job: the hardware keeps the draws of a chain in
-          * order on its own (probe/mali/bench BENCH_ORDER=1..3 hash the same either way, and as
+          * order on its own (the rendered frames hash the same either way, and as
           * the vendor driver's), and waiting for each job to finish before the next one starts
           * made 2000 small draws take 5.9 ms on Mali-G77 instead of 2.1. */
          struct pan_jc *jc = &cmdbuf->cur_batch->vtc_jc;

@@ -1249,7 +1249,13 @@ static bool
 image_barrier_invalidates_crc(const VkImageMemoryBarrier2 *barrier,
                               const struct panvk_image *image)
 {
-   if (barrier->oldLayout == VK_IMAGE_LAYOUT_PREINITIALIZED)
+   /* UNDEFINED is how an application says the memory may have been written through an alias
+    * (a buffer or another image bound to it). The CRCs then describe contents that are gone,
+    * and a later render whose tiles match them would skip the stores and keep the alias's
+    * bytes. Measured on G720: every pixel stale without this, the vendor
+    * driver clean. */
+   if (barrier->oldLayout == VK_IMAGE_LAYOUT_PREINITIALIZED ||
+       barrier->oldLayout == VK_IMAGE_LAYOUT_UNDEFINED)
       return true;
 
    const bool external_acquire =

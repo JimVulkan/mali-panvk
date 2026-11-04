@@ -702,7 +702,7 @@ panvk_per_arch(cmd_init_render_state)(struct panvk_cmd_buffer *cmdbuf,
       render->fb.layout.height_px = att_height;
       /* A render area larger than the attachments is invalid, but apps pass one: MojoLauncher
        * below 100% resolution renders a window-sized area into a smaller swapchain. Unclipped,
-       * the tiles past the image are written past its memory (probe/mali/vkanb VKANB_RA_SCALE);
+       * the tiles past the image are written past its memory;
        * the GPU page fault that follows panics MediaTek kernels (Mali-G615). */
       ra_px = pan_fb_bbox_clamp(ra_px,
                                 pan_fb_bbox_from_xywh(0, 0, att_width, att_height));

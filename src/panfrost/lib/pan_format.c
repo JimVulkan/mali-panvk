@@ -113,6 +113,9 @@ const struct pan_blendable_format
       BFMT(B5G5R5A1_UNORM, R5G5B5A1),
       BFMT(R5G5B5A1_UNORM, R5G5B5A1),
       BFMT(B5G5R5X1_UNORM, R5G5B5A1),
+      /* R or B in the top bits, A in bit 0: blended as R5G5B5A1, written back as A1B5G5R5. */
+      BFMT2(A1B5G5R5_UNORM, R5G5B5A1, A1B5G5R5, 0),
+      BFMT2(A1R5G5B5_UNORM, R5G5B5A1, A1B5G5R5, 0),
 
 #if PAN_ARCH >= 9
       BFMT_FLOAT(R16_FLOAT, R16F),
@@ -134,6 +137,7 @@ const struct pan_blendable_format
 
 #define FLAGS_V_____ (_V)
 #define FLAGS__T____ (_T)
+#define FLAGS__TR___ (_T | _R)
 #define FLAGS_VTR___ (_V | _T | _R)
 #define FLAGS_VTR_IB (_V | _T | _R | _I | _B)
 #define FLAGS_VT____ (_V | _T)
@@ -332,6 +336,11 @@ const struct pan_format GENX(pan_pipe_format)[PIPE_FORMAT_COUNT] = {
    FMT(B5G5R5X1_UNORM,          RGB5_A1_UNORM,   BGR1, L, VT__IB),
    FMT(R5G5B5A1_UNORM,          RGB5_A1_UNORM,   RGBA, L, VTR_IB),
    FMT(B5G5R5A1_UNORM,          RGB5_A1_UNORM,   BGRA, L, VTR_IB),
+   /* VK_FORMAT_R5G5B5A1_UNORM_PACK16 (R in the top bits, A in bit 0): Eden's format for the Switch
+    * A1B5G5R5 textures. */
+   FMT(A1B5G5R5_UNORM,          A1_BGR5_UNORM,   RGBA, L, _TR___),
+   /* VK_FORMAT_B5G5R5A1_UNORM_PACK16: the same layout with R and B swapped. */
+   FMT(A1R5G5B5_UNORM,          A1_BGR5_UNORM,   BGRA, L, _TR___),
    FMT(R10G10B10X2_UNORM,       RGB10_A2_UNORM,  RGB1, L, VTR_IB),
    FMT(B10G10R10X2_UNORM,       RGB10_A2_UNORM,  BGR1, L, VTR_IB),
    FMT(R10G10B10A2_UNORM,       RGB10_A2_UNORM,  RGBA, L, VTR_IB),
@@ -399,6 +408,7 @@ const struct pan_format GENX(pan_pipe_format)[PIPE_FORMAT_COUNT] = {
    FMT(R8G8_SNORM,              RG8_SNORM,       RG01, L, VTR_IB),
    FMT(R16G16_SNORM,            RG16_SNORM,      RG01, L, VTR_IB),
    FMT(R8G8B8_SNORM,            RGB8_SNORM,      RGB1, L, VTR_IB),
+   FMT(B8G8R8_SNORM,            RGB8_SNORM,      BGR1, L, VT____),
    FMT(R8G8B8A8_SNORM,          RGBA8_SNORM,     RGBA, L, VTR_IB),
    FMT(B8G8R8A8_SNORM,          RGBA8_SNORM,     BGRA, L, VTR_IB),
    FMT(R16G16B16A16_SNORM,      RGBA16_SNORM,    RGBA, L, VTR_IB),
@@ -409,6 +419,7 @@ const struct pan_format GENX(pan_pipe_format)[PIPE_FORMAT_COUNT] = {
    FMT(R8G8_SNORM,              RG8_SNORM,       RG01, L, VT__IB),
    FMT(R16G16_SNORM,            RG16_SNORM,      RG01, L, VT__IB),
    FMT(R8G8B8_SNORM,            RGB8_SNORM,      RGB1, L, VT__IB),
+   FMT(B8G8R8_SNORM,            RGB8_SNORM,      BGR1, L, VT____),
    FMT(R8G8B8A8_SNORM,          RGBA8_SNORM,     RGBA, L, VT__IB),
    FMT(B8G8R8A8_SNORM,          RGBA8_SNORM,     BGRA, L, VT__IB),
    FMT(R16G16B16A16_SNORM,      RGBA16_SNORM,    RGBA, L, VT__IB),
@@ -425,8 +436,8 @@ const struct pan_format GENX(pan_pipe_format)[PIPE_FORMAT_COUNT] = {
    FMT(L32_SINT,                R32I,            RRR1, L, VTR_IB),
    FMT(I32_UINT,                R32UI,           RRRR, L, VTR_IB),
    FMT(L32_UINT,                R32UI,           RRR1, L, VTR_IB),
-   FMT(B8G8R8_UINT,             RGB8UI,          BGR1, L, V_____),
-   FMT(B8G8R8_SINT,             RGB8I,           BGR1, L, V_____),
+   FMT(B8G8R8_UINT,             RGB8UI,          BGR1, L, VT____),
+   FMT(B8G8R8_SINT,             RGB8I,           BGR1, L, VT____),
    FMT(B8G8R8A8_UINT,           RGBA8UI,         BGRA, L, VTR_IB),
    FMT(B8G8R8A8_SINT,           RGBA8I,          BGRA, L, VTR_IB),
    FMT(A8R8G8B8_UINT,           RGBA8UI,         GBAR, L, VTR_IB),
@@ -437,7 +448,7 @@ const struct pan_format GENX(pan_pipe_format)[PIPE_FORMAT_COUNT] = {
    FMT(R8G8_UINT,               RG8UI,           RG01, L, VTR_IB),
    FMT(R16G16_UINT,             RG16UI,          RG01, L, VTR_IB),
    FMT(R32G32_UINT,             RG32UI,          RG01, L, VTR_IB),
-   FMT(R8G8B8_UINT,             RGB8UI,          RGB1, L, V_____),
+   FMT(R8G8B8_UINT,             RGB8UI,          RGB1, L, VT____),
    FMT(R32G32B32_UINT,          RGB32UI,         RGB1, L, VTR_IB),
    FMT(R8G8B8A8_UINT,           RGBA8UI,         RGBA, L, VTR_IB),
    FMT(R16G16B16A16_UINT,       RGBA16UI,        RGBA, L, VTR_IB),
@@ -486,13 +497,13 @@ const struct pan_format GENX(pan_pipe_format)[PIPE_FORMAT_COUNT] = {
 #endif
 
    /* Don't allow render/texture for 48-bit  */
-   FMT(R16G16B16_UNORM,         RGB16_UNORM,     RGB1, L, V_____),
-   FMT(R16G16B16_SINT,          RGB16I,          RGB1, L, V_____),
-   FMT(R16G16B16_FLOAT,         RGB16F,          RGB1, L, V_____),
+   FMT(R16G16B16_UNORM,         RGB16_UNORM,     RGB1, L, VT____),
+   FMT(R16G16B16_SINT,          RGB16I,          RGB1, L, VT____),
+   FMT(R16G16B16_FLOAT,         RGB16F,          RGB1, L, VT____),
    FMT(R16G16B16_USCALED,       RGB16UI,         RGB1, L, V_____),
    FMT(R16G16B16_SSCALED,       RGB16I,          RGB1, L, V_____),
-   FMT(R16G16B16_SNORM,         RGB16_SNORM,     RGB1, L, V_____),
-   FMT(R16G16B16_UINT,          RGB16UI,         RGB1, L, V_____),
+   FMT(R16G16B16_SNORM,         RGB16_SNORM,     RGB1, L, VT____),
+   FMT(R16G16B16_UINT,          RGB16UI,         RGB1, L, VT____),
    FMT(R4G4B4A4_UNORM,          RGBA4_UNORM,     RGBA, L, VTR___),
    FMT(B4G4R4A4_UNORM,          RGBA4_UNORM,     BGRA, L, VTR___),
    FMT(A4R4G4B4_UNORM,          RGBA4_UNORM,     ARGB, L, VTR___),
@@ -543,7 +554,7 @@ const struct pan_format GENX(pan_pipe_format)[PIPE_FORMAT_COUNT] = {
    FMT(R16G16_SINT,             RG16I,           RG01, L, VTR_IB),
    FMT(R32G32_SINT,             RG32I,           RG01, L, VTR_IB),
    FMT(R16G16_FLOAT,            RG16F,           RG01, L, VTR_IB),
-   FMT(R8G8B8_SINT,             RGB8I,           RGB1, L, V_____),
+   FMT(R8G8B8_SINT,             RGB8I,           RGB1, L, VT____),
    FMT(R32G32B32_SINT,          RGB32I,          RGB1, L, VTR_IB),
    FMT(R8G8B8A8_SINT,           RGBA8I,          RGBA, L, VTR_IB),
    FMT(R16G16B16A16_SINT,       RGBA16I,         RGBA, L, VTR_IB),

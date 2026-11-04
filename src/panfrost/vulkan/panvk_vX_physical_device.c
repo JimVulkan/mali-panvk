@@ -351,7 +351,8 @@ panvk_per_arch(get_physical_device_features)(
       .depthBounds = false,
       .wideLines = true,
       .largePoints = true,
-      .alphaToOne = false,
+      /* blend shaders force alpha to one (panvk_vX_blend.c), JM and CSF */
+      .alphaToOne = true,
       /* gl_ViewportIndex from a geometry shader (panvk_nir_lower_viewport_scissor_fs). */
       .multiViewport = true,
       .samplerAnisotropy = true,
@@ -366,7 +367,7 @@ panvk_per_arch(get_physical_device_features)(
       /* v6/v7 run the vertex shader as a plain VERTEX job, once per vertex of the range --
        * IDVS is off there (panvk_vX_shader.c), which is what speculative references came
        * from. */
-      /* v13 shades only referenced vertices (probe/mali/vsstore.c, G725), and IDVS splits the
+      /* v13 shades only referenced vertices (measured on the G725), and IDVS splits the
        * stores over the position and varying variants, which the spec allows as extra
        * invocations. vkd3d-proton needs this for D3D12 feature level 11_1 and up. */
       .vertexPipelineStoresAndAtomics =
@@ -583,7 +584,7 @@ panvk_per_arch(get_physical_device_features)(
       .extendedDynamicState3RasterizationSamples = true,
       .extendedDynamicState3SampleMask = true,
       .extendedDynamicState3AlphaToCoverageEnable = true,
-      .extendedDynamicState3AlphaToOneEnable = false,
+      .extendedDynamicState3AlphaToOneEnable = true,
       .extendedDynamicState3LogicOpEnable = true,
       .extendedDynamicState3ColorBlendEnable = true,
       .extendedDynamicState3ColorBlendEquation = true,
@@ -1048,8 +1049,8 @@ panvk_per_arch(get_physical_device_properties)(
        * and later take unaligned global accesses (bifrost_nir.c never
        * splits or refuses to vectorize them on v9+), and SSBOs at 4/8/12-byte
        * offsets take 128-bit loads, stores and atomics correctly on the G68
-       * (v9), G720 (v12), G925 (v13) and G1-Ultra (v14) (probe/mali/heapt.c,
-       * HEAPT_SSBO_OFF). vkd3d-proton's descriptor heap path needs <= 4. */
+       * (v9), G720 (v12), G925 (v13) and G1-Ultra (v14) (measured).
+       * vkd3d-proton's descriptor heap path needs <= 4. */
       .minStorageBufferOffsetAlignment = PAN_ARCH >= 9 ? 4 : 16,
       /* Signed 4-bit value. */
       .minTexelOffset = -8,

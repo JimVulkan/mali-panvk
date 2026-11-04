@@ -23,6 +23,22 @@
 /* Forward declaration — defined after pan_bytes_per_pixel_tib */
 static unsigned pan_cbuf_bytes_per_pixel(const struct pan_fb_info *fb);
 
+/* The A1B5G5R5 writeback format places the channels by name (A in bit 0, R in the top bits), so
+ * the inverted format swizzle would reorder them a second time. R5G5B5A1_UNORM_PACK16 wants them
+ * as they are, B5G5R5A1_UNORM_PACK16 with R and B swapped (bytes equal to the vendor's on the
+ * G720). */
+static inline void
+rt_swizzle_a1_bgr5(enum pipe_format pfmt, unsigned char *swizzle)
+{
+   if (pfmt != PIPE_FORMAT_A1B5G5R5_UNORM && pfmt != PIPE_FORMAT_A1R5G5B5_UNORM)
+      return;
+   const bool bgr = pfmt == PIPE_FORMAT_A1R5G5B5_UNORM;
+   swizzle[0] = bgr ? PIPE_SWIZZLE_Z : PIPE_SWIZZLE_X;
+   swizzle[1] = PIPE_SWIZZLE_Y;
+   swizzle[2] = bgr ? PIPE_SWIZZLE_X : PIPE_SWIZZLE_Z;
+   swizzle[3] = PIPE_SWIZZLE_W;
+}
+
 static enum mali_msaa
 mali_sampling_mode(const struct pan_image_view *view)
 {
@@ -711,6 +727,7 @@ get_rt_formats(enum pipe_format pfmt, uint32_t *writeback, uint32_t *internal,
       *internal = bfmt->internal;
       *writeback = bfmt->writeback;
       pan_invert_swizzle(desc->swizzle, swizzle);
+      rt_swizzle_a1_bgr5(pfmt, swizzle);
    } else {
       /* Construct RAW internal/writeback, where internal is
        * specified logarithmically (round to next power-of-two).
@@ -1689,6 +1706,7 @@ GENX(pan_emit_fbd)(const struct pan_fb_info *fb, unsigned layer_idx,
          /* The swizzle for rendering is inverted from texturing */
          unsigned char swizzle[4];
          pan_invert_swizzle(desc->swizzle, swizzle);
+         rt_swizzle_a1_bgr5(rt->format, swizzle);
          cfg.swizzle = pan_translate_swizzle_4(swizzle);
 
          struct pan_blendable_format fmt =

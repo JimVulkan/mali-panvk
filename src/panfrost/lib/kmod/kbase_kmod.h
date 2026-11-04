@@ -19,7 +19,7 @@ struct pan_kmod_dev;
 struct pan_kmod_bo;
 
 /* core_req values are TAKEN VERBATIM from the vendor driver's own atoms, captured while it
- * rendered a triangle (probe/mali/glprobe2.c, logs/mspy_gl.txt). The frame arrived as ONE
+ * rendered a triangle. The frame arrived as ONE
  * JOB_SUBMIT carrying two atoms:
  *
  *    atom 1  jc=...1040  core_req=0x4e    pre_dep = none

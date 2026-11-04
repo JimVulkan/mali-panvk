@@ -653,7 +653,7 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
    /* On kbase a context belongs to the open file, not to the fd: a dup shares it, with its atom
     * numbers and its one event queue. Each logical device reads completions from its own thread,
     * so two devices on one context took each other's events and dropped them, and the second
-    * device's fences never signalled (probe/mali/vkdev2.c; a test app that keeps its D3D11
+    * device's fences never signalled (seen with a test app that keeps its D3D11
     * device while it runs the D3D9 test). So each logical device opens its own context. */
    const int dev_fd = pan_kmod_dev_is_kbase(physical_device->kmod.dev)
                          ? open(PANVK_KBASE_PATH, O_RDWR | O_CLOEXEC)
