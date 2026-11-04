@@ -69,7 +69,9 @@ def main():
 
     meta = {
         'schemaVersion': 1,
-        'name': 'PanVK Mali Bifrost/Valhall (kbase) (Mesa %s%s)' % (mesa_version, suffix),
+        # Launchers (Winlator, Bannerlator) install a driver into a directory named after this:
+        # no path separators, or the install is left behind as "tmp".
+        'name': 'PanVK Mali Bifrost and Valhall (kbase) (Mesa %s%s)' % (mesa_version, suffix),
         'description': 'PanVK for Mali Bifrost and Valhall GPUs on the stock Arm kbase kernel '
                        'driver, based on Mesa %s.' % mesa_version,
         'author': 'JimVulkan',
