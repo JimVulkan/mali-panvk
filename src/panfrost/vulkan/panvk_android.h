@@ -15,7 +15,10 @@ struct panvk_device;
 
 /* ARM gralloc's first private usage bit, and GRALLOC_USAGE_HW_COMPOSER. See panvk_android.c. */
 #define MALI_GRALLOC_USAGE_NO_AFBC (1u << 29)
+/* Android's gralloc.h already declares this when included. */
+#ifndef GRALLOC_USAGE_HW_COMPOSER
 #define GRALLOC_USAGE_HW_COMPOSER  (1u << 11)
+#endif
 
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
 
