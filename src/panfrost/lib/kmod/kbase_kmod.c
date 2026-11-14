@@ -145,6 +145,8 @@ union kbase_ioctl_mem_import {
 };
 #define KBASE_IOCTL_MEM_IMPORT                                                                    \
    _IOC(_IOC_READ | _IOC_WRITE, KBASE_IOCTL_TYPE, 22, 24)
+#define KBASE_IOCTL_MEM_IMPORT_32                                                                 \
+   _IOC(_IOC_READ | _IOC_WRITE, KBASE_IOCTL_TYPE, 22, 32)
 #define KBASE_IOCTL_MEM_IMPORT_40                                                                 \
    _IOC(_IOC_READ | _IOC_WRITE, KBASE_IOCTL_TYPE, 22, 40)
 #define BASE_MEM_IMPORT_TYPE_UMM 2
@@ -285,12 +287,15 @@ struct kbase_kmod_dev {
    uint32_t js0_features;
    /* CSF: queue groups instead of job atoms (kbase UAPI 1.x). */
    bool csf;
+   /* Successful MEM_IMPORT ioctl payload size: 0 means default (24 bytes).
+    * Stored per device, rather than globally across unrelated kbase contexts. */
+   uint32_t mem_import_size;
    struct drm_panthor_csif_info csif;
    struct kbase_csf_dev *csfq;
 };
 
 static void kbase_queue_init(struct kbase_queue *q);
-static int kbase_probe_atom_layout_fd(int fd);
+static int kbase_probe_atom_layout_fd(int fd, bool probe_extended_atoms);
 static void kbase_queue_finish(struct kbase_kmod_dev *kdev);
 static bool kbase_csf_dev_init(struct kbase_kmod_dev *kdev);
 static void kbase_csf_dev_finish(struct kbase_kmod_dev *kdev);
@@ -562,7 +567,11 @@ kbase_kmod_dev_create(int fd, uint32_t flags, const struct pan_kmod_allocator *a
          goto err_free_dev;
       }
    } else {
-      kbase_dev->atom_layout = kbase_probe_atom_layout_fd(fd);
+      /* Huawei Kirin 990 uses 72-byte JM atoms. Only probe this layout
+       * on Mali-G76 and accept it after verifying a dependency-only job. */
+      const bool probe_extended_atoms =
+         (kbase_dev->base.props.gpu_id & 0xffff0000u) == 0x72110000u;
+      kbase_dev->atom_layout = kbase_probe_atom_layout_fd(fd, probe_extended_atoms);
    }
    return &kbase_dev->base;
 
@@ -789,13 +798,28 @@ kbase_kmod_bo_import(struct pan_kmod_dev *dev, int fd)
    req.in.flags = 0xfull | BASE_MEM_SAME_VA;
    req.in.phandle = (uint64_t)(uintptr_t)&dmabuf;
    req.in.type = BASE_MEM_IMPORT_TYPE_UMM;
-   static bool import_40;
-   int ret = pan_kmod_ioctl(dev->fd, import_40 ? KBASE_IOCTL_MEM_IMPORT_40
-                                                : KBASE_IOCTL_MEM_IMPORT, &req);
-   if (ret && errno == ENOTTY && !import_40) {
+   /*
+    * Huawei JM kernels such as Kirin 990 (HarmonyOS 4.2) require the
+    * 32-byte form of MEM_IMPORT nr 22. The standard 24-byte request
+    * returns ENOTTY. Retain the existing 40-byte fallback for newer
+    * kernels, and cache the successful layout per kbase device.
+    */
+   const uint32_t import_size = kbase_dev->mem_import_size;
+   int ret = pan_kmod_ioctl(
+      dev->fd,
+      import_size == 32 ? KBASE_IOCTL_MEM_IMPORT_32 :
+      import_size == 40 ? KBASE_IOCTL_MEM_IMPORT_40 :
+                          KBASE_IOCTL_MEM_IMPORT,
+      &req);
+   if (ret && errno == ENOTTY && import_size == 0 && !kbase_dev->csf) {
+      ret = pan_kmod_ioctl(dev->fd, KBASE_IOCTL_MEM_IMPORT_32, &req);
+      if (!ret)
+         kbase_dev->mem_import_size = 32;
+   }
+   if (ret && errno == ENOTTY && import_size == 0) {
       ret = pan_kmod_ioctl(dev->fd, KBASE_IOCTL_MEM_IMPORT_40, &req);
       if (!ret)
-         import_40 = true;
+         kbase_dev->mem_import_size = 40;
    }
    if (ret) {
       mesa_loge("kbase: MEM_IMPORT of dma-buf fd %d failed (err=%d)", fd, errno);
@@ -1426,18 +1450,27 @@ static_assert(sizeof(struct kbase_jd_atom) == 48, "base_jd_atom_v2 up to renderp
 enum kbase_atom_layout {
    KBASE_ATOM_SEQ_NR_FIRST = 0,
    KBASE_ATOM_V2_FRAME_NR,
+   KBASE_ATOM_SEQ_NR_72, /* Huawei G76: seq_nr plus full 64-byte base atom */
 };
 #define KBASE_ATOM_STRIDE 64
+#define KBASE_ATOM_STRIDE_EXTENDED 72
+
+static unsigned
+kbase_atom_stride(enum kbase_atom_layout layout)
+{
+   return layout == KBASE_ATOM_SEQ_NR_72 ? KBASE_ATOM_STRIDE_EXTENDED : KBASE_ATOM_STRIDE;
+}
 
 static void
 kbase_pack_atoms(enum kbase_atom_layout layout, const struct kbase_jd_atom *in, unsigned n,
                  uint8_t *out)
 {
-   memset(out, 0, (size_t)n * KBASE_ATOM_STRIDE);
+   const unsigned stride = kbase_atom_stride(layout);
+   memset(out, 0, (size_t)n * stride);
    for (unsigned i = 0; i < n; i++) {
-      /* seq_nr stays 0: the kernel only uses it for its own tracing. */
-      uint8_t *dst = out + (size_t)i * KBASE_ATOM_STRIDE;
-      memcpy(layout == KBASE_ATOM_SEQ_NR_FIRST ? dst + 8 : dst, &in[i], sizeof(in[i]));
+      /* Extended and standard seq_nr-first layouts put the atom after seq_nr. */
+      uint8_t *dst = out + (size_t)i * stride;
+      memcpy(layout == KBASE_ATOM_V2_FRAME_NR ? dst : dst + 8, &in[i], sizeof(in[i]));
    }
 }
 
@@ -1529,9 +1562,54 @@ kbase_probe_atom_layout(int fd)
    return KBASE_ATOM_SEQ_NR_FIRST;
 }
 
-static int
-kbase_probe_atom_layout_fd(int fd)
+/* A dependency-only job is safe to probe: it has no shader job chain.
+ * Confirm completion *and* the event payload, not just a successful ioctl.
+ * The 72-byte layout was measured on Huawei HarmonyOS 4.2 (JM uAPI 11.38).
+ * A failed 72-byte probe falls back to the unmodified 64-byte probe. */
+static bool
+kbase_probe_extended_atom_layout(int fd)
 {
+   const uint64_t second_tag = 0x50414e564b3732ull; /* PANVK72 */
+   struct kbase_jd_atom a = {
+      .udata = {KBASE_ATOM_PROBE_TAG, second_tag},
+      .atom_number = 1,
+   };
+   uint8_t packed[KBASE_ATOM_STRIDE_EXTENDED];
+   kbase_pack_atoms(KBASE_ATOM_SEQ_NR_72, &a, 1, packed);
+   struct kbase_ioctl_job_submit req = {
+      .addr = (uintptr_t)packed, .nr_atoms = 1, .stride = KBASE_ATOM_STRIDE_EXTENDED};
+
+   if (pan_kmod_ioctl(fd, KBASE_IOCTL_JOB_SUBMIT, &req)) {
+      mesa_logw("kbase: extended 72-byte atom probe refused (err=%d); using 64-byte probe",
+                errno);
+      return false;
+   }
+
+   for (unsigned tries = 0; tries < 20; tries++) {
+      struct pollfd pfd = {.fd = fd, .events = POLLIN};
+      if (poll(&pfd, 1, 50) <= 0)
+         continue;
+      struct kbase_jd_event ev[4];
+      const ssize_t n = read(fd, ev, sizeof(ev));
+      for (ssize_t i = 0; n > 0 && i < n / (ssize_t)sizeof(ev[0]); i++) {
+         if (ev[i].event_code == KBASE_JD_EVENT_DONE &&
+             ev[i].atom_number == 1 &&
+             ev[i].udata[0] == KBASE_ATOM_PROBE_TAG &&
+             ev[i].udata[1] == second_tag) {
+            mesa_logi("kbase: Mali-G76 72-byte JM atom probe confirmed; using full 72-byte JM atoms");
+            return true;
+         }
+      }
+   }
+   mesa_logw("kbase: extended 72-byte atom probe event not confirmed; using 64-byte probe");
+   return false;
+}
+
+static int
+kbase_probe_atom_layout_fd(int fd, bool probe_extended_atoms)
+{
+   if (probe_extended_atoms && kbase_probe_extended_atom_layout(fd))
+      return KBASE_ATOM_SEQ_NR_72;
    return kbase_probe_atom_layout(fd);
 }
 
@@ -1819,16 +1897,18 @@ pan_kmod_kbase_submit_async(struct pan_kmod_dev *dev, const struct pan_kmod_kbas
       kbase_add_order_dep(f, track[1]);
    }
 
-   uint8_t packed[(PAN_KMOD_KBASE_MAX_ATOMS + 1) * KBASE_ATOM_STRIDE];
+   uint8_t packed[(PAN_KMOD_KBASE_MAX_ATOMS + 1) * KBASE_ATOM_STRIDE_EXTENDED];
+   const unsigned stride = kbase_atom_stride(kdev->atom_layout);
    kbase_pack_atoms(kdev->atom_layout, jd, need, packed);
    struct kbase_ioctl_job_submit req = {
       .addr = (uintptr_t)packed,
       .nr_atoms = need,
-      .stride = KBASE_ATOM_STRIDE,
+      .stride = stride,
    };
 
    if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_JOB_SUBMIT, &req)) {
-      mesa_loge("kbase: JOB_SUBMIT of %u atoms failed (err=%d)", need, errno);
+      mesa_loge("kbase: JOB_SUBMIT of %u atoms failed (err=%d stride=%u)",
+                need, errno, stride);
       for (unsigned i = 0; i < need; i++) {
          q->owner[real[i]] = NULL;
          q->is_fence[real[i]] = false;
