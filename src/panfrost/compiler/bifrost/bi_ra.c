@@ -947,6 +947,7 @@ bi_coalesce_collects(bi_context *ctx, unsigned first_reg)
 {
    bi_instr **def = calloc(first_reg, sizeof(*def));
    BITSET_WORD *skip = BITSET_CALLOC(first_reg);
+   BITSET_WORD *feeds_fixed = BITSET_CALLOC(first_reg);
    bi_index *rename = calloc(first_reg, sizeof(*rename));
    bool any = false;
 
@@ -955,6 +956,11 @@ bi_coalesce_collects(bi_context *ctx, unsigned first_reg)
                          I->op == BI_OPCODE_ZS_EMIT || I->op == BI_OPCODE_PHI ||
                          I->op == BI_OPCODE_SPLIT_I32 ||
                          I->op == BI_OPCODE_COLLECT_I32 || bi_is_tied(I);
+
+      const bool fixed_consumer = I->op == BI_OPCODE_BLEND ||
+                                  I->op == BI_OPCODE_ATEST ||
+                                  I->op == BI_OPCODE_ZS_EMIT ||
+                                  bi_is_tied(I);
 
       bi_foreach_dest(I, d) {
          const unsigned v = I->dest[d].value;
@@ -972,11 +978,19 @@ bi_coalesce_collects(bi_context *ctx, unsigned first_reg)
                BITSET_SET(skip, I->src[s].value);
          }
       }
+
+      if (fixed_consumer) {
+         bi_foreach_ssa_src(I, s) {
+            if (I->src[s].value < first_reg)
+               BITSET_SET(feeds_fixed, I->src[s].value);
+         }
+      }
    }
 
    bi_foreach_instr_global(ctx, I) {
       if (I->op != BI_OPCODE_COLLECT_I32 || I->nr_srcs < 2 ||
-          I->dest[0].value >= first_reg || I->dest[0].memory)
+          I->dest[0].value >= first_reg || I->dest[0].memory ||
+          BITSET_TEST(feeds_fixed, I->dest[0].value))
          continue;
 
       bi_foreach_src(I, i) {
@@ -1016,6 +1030,7 @@ bi_coalesce_collects(bi_context *ctx, unsigned first_reg)
    }
 
    free(rename);
+   free(feeds_fixed);
    free(skip);
    free(def);
    return any;
