@@ -417,6 +417,8 @@ panvk_per_arch(cmd_open_batch)(struct panvk_cmd_buffer *cmdbuf)
                 VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    assert(cmdbuf->cur_batch);
    cmdbuf->cur_batch->jobs = UTIL_DYNARRAY_INIT;
+   cmdbuf->cur_batch->job_templs = UTIL_DYNARRAY_INIT;
+   cmdbuf->cur_batch->job_sizes = UTIL_DYNARRAY_INIT;
    cmdbuf->cur_batch->event_ops = UTIL_DYNARRAY_INIT;
    if (cmdbuf->pending_frag_wait) {
       cmdbuf->cur_batch->order |= PANVK_BATCH_WAIT_FRAG;
@@ -514,6 +516,8 @@ panvk_reset_cmdbuf(struct vk_command_buffer *vk_cmdbuf,
    list_for_each_entry_safe(struct panvk_batch, batch, &cmdbuf->batches, node) {
       list_del(&batch->node);
       util_dynarray_fini(&batch->jobs);
+      util_dynarray_fini(&batch->job_templs);
+      util_dynarray_fini(&batch->job_sizes);
       util_dynarray_fini(&batch->event_ops);
 
       vk_free(&cmdbuf->vk.pool->alloc, batch);
@@ -540,6 +544,8 @@ panvk_destroy_cmdbuf(struct vk_command_buffer *vk_cmdbuf)
    list_for_each_entry_safe(struct panvk_batch, batch, &cmdbuf->batches, node) {
       list_del(&batch->node);
       util_dynarray_fini(&batch->jobs);
+      util_dynarray_fini(&batch->job_templs);
+      util_dynarray_fini(&batch->job_sizes);
       util_dynarray_fini(&batch->event_ops);
 
       vk_free(&cmdbuf->vk.pool->alloc, batch);
