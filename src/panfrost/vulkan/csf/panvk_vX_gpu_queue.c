@@ -557,7 +557,11 @@ init_subqueue(struct panvk_gpu_queue *queue, enum panvk_subqueue_id subqueue)
    panvk_priv_mem_write(queue->syncobjs,
                         subqueue * sizeof(struct panvk_cs_sync64),
                         struct panvk_cs_sync64, syncobj) {
-      syncobj->seqno = 1;
+      *syncobj = (struct panvk_cs_sync64){
+         .seqno = 1,
+         .error = 0,
+         .pad = 0,
+      };
    }
 
    if (subqueue != PANVK_SUBQUEUE_COMPUTE) {
@@ -668,6 +672,8 @@ init_queue(struct panvk_gpu_queue *queue)
    if (!panvk_priv_mem_check_alloc(queue->syncobjs))
       return panvk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                           "Failed to allocate subqueue sync objects");
+
+   memset(panvk_priv_mem_host_addr(queue->syncobjs), 0, alloc_info.size);
 
    result = init_render_desc_ringbuf(queue);
    if (result != VK_SUCCESS)
