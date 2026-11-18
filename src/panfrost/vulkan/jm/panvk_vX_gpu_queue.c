@@ -113,8 +113,21 @@ panvk_queue_prepare_batch(struct panvk_device *dev, struct panvk_cmd_buffer *cmd
 
          struct mali_tiler_context_packed *ctxs = batch->tiler.ctx_descs.cpu;
 
-         for (uint32_t i = 0; i < batch->fb.layer_count; i++)
+#if PAN_ARCH >= 9
+         unsigned num_tds = DIV_ROUND_UP(batch->fb.layer_count, 8);
+#else
+         unsigned num_tds = batch->fb.layer_count;
+#endif
+         for (uint32_t i = 0; i < num_tds; i++) {
             memcpy(&ctxs[i], &batch->tiler.ctx_templ, sizeof(*ctxs));
+#if PAN_ARCH >= 9
+            uint32_t td_base = i * 8;
+            uint32_t layers_in_td = MIN2(batch->fb.layer_count - td_base, 8);
+            int32_t layer_offset = -(int32_t)td_base;
+            ctxs[i].opaque[4] = util_bitpack_uint(layers_in_td - 1, 0, 7) |
+                                util_bitpack_sint(layer_offset, 8, 16);
+#endif
+         }
       }
 
       /* We don't keep track of BO <-> job relationship, so let's just flush the

@@ -331,24 +331,23 @@ panvk_per_arch(cmd_prepare_tiler_context)(struct panvk_cmd_buffer *cmdbuf,
    struct panvk_physical_device *phys_dev =
       to_panvk_physical_device(cmdbuf->vk.base.device->physical);
    struct panvk_batch *batch = cmdbuf->cur_batch;
-   uint64_t tiler_desc;
 
-   if (batch->tiler.ctx_descs.gpu) {
-      tiler_desc =
-         batch->tiler.ctx_descs.gpu + (pan_size(TILER_CONTEXT) * layer_idx);
+   if (batch->tiler.ctx_descs.gpu)
       goto out_set_layer_ctx;
-   }
 
    const struct pan_fb_layout *fb = &cmdbuf->state.gfx.render.fb.layout;
    uint32_t layer_count = cmdbuf->state.gfx.render.layer_count;
+#if PAN_ARCH >= 9
+   unsigned num_tds = DIV_ROUND_UP(layer_count, 8);
+#else
+   unsigned num_tds = layer_count;
+#endif
+
    batch->tiler.heap_desc = panvk_cmd_alloc_desc(cmdbuf, TILER_HEAP);
    batch->tiler.ctx_descs =
-      panvk_cmd_alloc_desc_array(cmdbuf, layer_count, TILER_CONTEXT);
+      panvk_cmd_alloc_desc_array(cmdbuf, num_tds, TILER_CONTEXT);
    if (!batch->tiler.heap_desc.gpu || !batch->tiler.ctx_descs.gpu)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-
-   tiler_desc =
-      batch->tiler.ctx_descs.gpu + (pan_size(TILER_CONTEXT) * layer_idx);
 
    /* kbase: the batches take turns on the two heaps, in recording order within the command
     * buffer and, through the device, from one command buffer to the next. Recording order is
@@ -392,18 +391,30 @@ panvk_per_arch(cmd_prepare_tiler_context)(struct panvk_cmd_buffer *cmdbuf,
    struct mali_tiler_context_packed *ctxs = batch->tiler.ctx_descs.cpu;
 
    assert(layer_count > 0);
-   for (uint32_t i = 0; i < layer_count; i++) {
+   for (uint32_t i = 0; i < num_tds; i++) {
       STATIC_ASSERT(
          !(pan_size(TILER_CONTEXT) & (pan_alignment(TILER_CONTEXT) - 1)));
 
       memcpy(&ctxs[i], &batch->tiler.ctx_templ, sizeof(*ctxs));
+#if PAN_ARCH >= 9
+      uint32_t td_base = i * 8;
+      uint32_t layers_in_td = MIN2(layer_count - td_base, 8);
+      int32_t layer_offset = -(int32_t)td_base;
+      ctxs[i].opaque[4] = util_bitpack_uint(layers_in_td - 1, 0, 7) |
+                          util_bitpack_sint(layer_offset, 8, 16);
+#endif
    }
 
 out_set_layer_ctx:
-   if (PAN_ARCH >= 9)
-      batch->tiler.ctx.valhall.desc = tiler_desc;
-   else
-      batch->tiler.ctx.bifrost.desc = tiler_desc;
+   if (PAN_ARCH >= 9) {
+      uint32_t td_idx = layer_idx / 8;
+      batch->tiler.ctx.valhall.desc =
+         batch->tiler.ctx_descs.gpu + (td_idx * pan_size(TILER_CONTEXT));
+      batch->tiler.ctx.valhall.layer_offset = td_idx * 8;
+   } else {
+      batch->tiler.ctx.bifrost.desc =
+         batch->tiler.ctx_descs.gpu + (pan_size(TILER_CONTEXT) * layer_idx);
+   }
 
    return VK_SUCCESS;
 }
