@@ -605,7 +605,7 @@ panvk_create_cmdbuf(struct vk_command_pool *vk_pool, VkCommandBufferLevel level,
       .owns_bos = true,
       .needs_locking = false,
    };
-   panvk_pool_init(&cmdbuf->desc_pool, device, &pool->desc_bo_pool, NULL,
+   panvk_pool_init(&cmdbuf->desc_pool, device, NULL, NULL,
                    &desc_pool_props);
 
    struct panvk_pool_properties tls_pool_props = {
