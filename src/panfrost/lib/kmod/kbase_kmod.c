@@ -781,12 +781,18 @@ kbase_kmod_bo_import(struct pan_kmod_dev *dev, int fd)
    if (!bo)
       return NULL;
 
-   /* CPU and GPU read/write, SAME_VA. Not COHERENT_LOCAL: that is a property of memory kbase
-    * allocates, and an import is the exporter's. */
+   /* CPU and GPU read/write. On CSF (e.g., Mali-G615 / kbase r44p1), request COHERENT_LOCAL
+    * without SAME_VA/COHERENT_SYSTEM/IMPORT_SHARED: kbase sets GPU shareability for the imported
+    * dma-buf mapping from these flags, and the proprietary blob imports with PROT_ALL |
+    * COHERENT_LOCAL (0x80f); requesting SAME_VA or COHERENT_SYSTEM triggers GPU_SHAREABILITY_FAULT
+    * (0x88) on ACE-Lite hardware. On JM, keep SAME_VA. */
    int dmabuf = fd;
    union kbase_ioctl_mem_import req;
    memset(&req, 0, sizeof(req));
-   req.in.flags = 0xfull | BASE_MEM_SAME_VA;
+   if (kbase_dev->csf)
+      req.in.flags = 0xfull | BASE_MEM_COHERENT_LOCAL;
+   else
+      req.in.flags = 0xfull | BASE_MEM_SAME_VA;
    req.in.phandle = (uint64_t)(uintptr_t)&dmabuf;
    req.in.type = BASE_MEM_IMPORT_TYPE_UMM;
    static bool import_40;
