@@ -40,16 +40,71 @@
 static void panvk_signal_event_syncobjs(struct panvk_gpu_queue *queue,
                                         struct panvk_batch *batch);
 
+static uint32_t
+panvk_jm_job_size(const void *job)
+{
+   const uint32_t *w = job;
+   uint32_t job_type = (w[4] >> 1) & 0x7f;
+
+   switch (job_type) {
+   case MALI_JOB_TYPE_NULL:
+      return pan_size(JOB_HEADER);
+   case MALI_JOB_TYPE_WRITE_VALUE:
+      return pan_size(WRITE_VALUE_JOB);
+   case MALI_JOB_TYPE_CACHE_FLUSH:
+      return pan_size(CACHE_FLUSH_JOB);
+   case MALI_JOB_TYPE_COMPUTE:
+      return pan_size(COMPUTE_JOB);
+   case MALI_JOB_TYPE_FRAGMENT:
+      return pan_size(FRAGMENT_JOB);
+   case MALI_JOB_TYPE_TILER:
+      return pan_size(TILER_JOB);
+#if PAN_ARCH >= 9
+   case MALI_JOB_TYPE_MALLOC_VERTEX:
+      return pan_size(MALLOC_VERTEX_JOB);
+   case MALI_JOB_TYPE_FULLSCREEN:
+      return pan_size(FULLSCREEN_JOB);
+#else
+   case MALI_JOB_TYPE_VERTEX:
+      return pan_size(COMPUTE_JOB);
+#endif
+   default:
+      return pan_size(JOB_HEADER);
+   }
+}
+
 /* What every batch needs before it is (re)submitted: a batch issued before is reset, and the
  * command buffer's descriptors are made GPU-visible. */
 static void
 panvk_queue_prepare_batch(struct panvk_device *dev, struct panvk_cmd_buffer *cmdbuf,
                           struct panvk_batch *batch)
 {
-   /* Reset the batch if it's already been issued */
-   if (batch->issued) {
-      util_dynarray_foreach(&batch->jobs, void *, job)
-         memset((*job), 0, 4 * 4);
+   /* Snapshot clean job descriptors and sizes before first submission so
+    * resubmitting the command buffer can restore any payload fields overwritten
+    * by the GPU (e.g. MALLOC_VERTEX_JOB's embedded DRAW section on Valhall v9)
+    * without reading back the GPU-modified job header. */
+   if (!batch->issued) {
+      if (batch->job_templs.size == 0) {
+         util_dynarray_foreach(&batch->jobs, void *, job) {
+            uint32_t sz = panvk_jm_job_size(*job);
+            util_dynarray_append(&batch->job_sizes, sz);
+            void *dst = util_dynarray_grow_bytes(&batch->job_templs, 1, sz);
+            memcpy(dst, *job, sz);
+         }
+      }
+   } else {
+      const uint32_t *sizes = batch->job_sizes.data;
+      const uint8_t *src = batch->job_templs.data;
+      unsigned idx = 0;
+      util_dynarray_foreach(&batch->jobs, void *, job) {
+         if (src && sizes) {
+            uint32_t sz = sizes[idx++];
+            memcpy(*job, src, sz);
+            src += sz;
+         } else {
+            memset((*job), 0, 4 * 4);
+         }
+      }
 
       /* Reset the tiler before re-issuing the batch */
       if (batch->tiler.ctx_descs.cpu) {
@@ -58,8 +113,21 @@ panvk_queue_prepare_batch(struct panvk_device *dev, struct panvk_cmd_buffer *cmd
 
          struct mali_tiler_context_packed *ctxs = batch->tiler.ctx_descs.cpu;
 
-         for (uint32_t i = 0; i < batch->fb.layer_count; i++)
+#if PAN_ARCH >= 9
+         unsigned num_tds = DIV_ROUND_UP(batch->fb.layer_count, 8);
+#else
+         unsigned num_tds = batch->fb.layer_count;
+#endif
+         for (uint32_t i = 0; i < num_tds; i++) {
             memcpy(&ctxs[i], &batch->tiler.ctx_templ, sizeof(*ctxs));
+#if PAN_ARCH >= 9
+            uint32_t td_base = i * 8;
+            uint32_t layers_in_td = MIN2(batch->fb.layer_count - td_base, 8);
+            int32_t layer_offset = -(int32_t)td_base;
+            ctxs[i].opaque[4] = util_bitpack_uint(layers_in_td - 1, 0, 7) |
+                                util_bitpack_sint(layer_offset, 8, 16);
+#endif
+         }
       }
 
       /* We don't keep track of BO <-> job relationship, so let's just flush the
